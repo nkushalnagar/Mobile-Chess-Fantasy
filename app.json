@@ -1,0 +1,29 @@
+{
+  "expo": {
+    "name": "Fantasy Chess",
+    "slug": "fantasy-chess-mobile",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "splash": {
+      "resizeMode": "contain",
+      "backgroundColor": "#0f172a"
+    },
+    "assetBundlePatterns": [
+      "**/*"
+    ],
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.fantasychess.mobile"
+    },
+    "android": {
+      "package": "com.fantasychess.mobile"
+    },
+    "web": {
+    },
+    "scheme": "fantasychess",
+    "plugins": [
+      "expo-router"
+    ]
+  }
+}
