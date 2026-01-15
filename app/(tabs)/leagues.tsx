@@ -1,8 +1,11 @@
 import React, { useEffect, useState, useCallback } from 'react';
-import { View, Text, StyleSheet, FlatList, TouchableOpacity, RefreshControl, Image } from 'react-native';
+import { View, Text, StyleSheet, FlatList, TouchableOpacity, RefreshControl, Image, ScrollView } from 'react-native';
 import { useRouter } from 'expo-router';
 import { supabase } from '@/lib/supabase';
 import { useAuth } from '@/contexts/AuthContext';
+import { useTheme } from '@/contexts/ThemeContext';
+import { useDataCache } from '@/contexts/DataCacheContext';
+import SkeletonLoader from '@/components/SkeletonLoader';
 
 // Knight emblem images
 const KNIGHT_EMBLEMS = [
@@ -32,12 +35,13 @@ interface League {
 }
 
 export default function LeaguesTab() {
-  const [leagues, setLeagues] = useState<League[]>([]);
-  const [loading, setLoading] = useState(true);
+  const { leaguesPageData, setLeaguesPageData } = useDataCache();
+  const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [notificationCount, setNotificationCount] = useState(0);
   const router = useRouter();
   const { user, profile } = useAuth();
+  const { colors } = useTheme();
 
   const loadNotificationCount = useCallback(async () => {
     if (!profile?.username) return;
@@ -65,8 +69,11 @@ export default function LeaguesTab() {
 
       if (error) throw error;
 
-      const leagueData = data?.map((item: any) => item.leagues).filter(Boolean) || [];
-      setLeagues(leagueData);
+      const leagueData = data
+        ?.map((membership: any) => membership.leagues)
+        .filter(Boolean) || [];
+
+      setLeaguesPageData(leagueData);
     } catch (error) {
       console.error('Error fetching leagues:', error);
     } finally {
@@ -76,7 +83,8 @@ export default function LeaguesTab() {
   };
 
   useEffect(() => {
-    if (user) {
+    if (user && leaguesPageData === null) {
+      setLoading(true);
       fetchLeagues();
     }
     if (profile) {
@@ -84,7 +92,7 @@ export default function LeaguesTab() {
       const interval = setInterval(loadNotificationCount, 30000);
       return () => clearInterval(interval);
     }
-  }, [user, profile, loadNotificationCount]);
+  }, [user, profile, leaguesPageData, loadNotificationCount]);
 
   const onRefresh = () => {
     setRefreshing(true);
@@ -103,8 +111,8 @@ export default function LeaguesTab() {
 
   const renderLeague = ({ item }: { item: League }) => (
     <TouchableOpacity
-      style={styles.leagueCard}
-      onPress={() => router.push(`/league/${item.id}`)}
+      style={[styles.leagueCard, { backgroundColor: colors.cardBackground, borderColor: colors.border }]}
+      onPress={() => router.push(`/league/${item.id}?from=leagues`)}
     >
       <Image
         source={getEmblemForLeague(item.id)}
@@ -112,7 +120,7 @@ export default function LeaguesTab() {
         resizeMode="contain"
       />
       <View style={styles.leagueInfo}>
-        <Text style={styles.leagueName} numberOfLines={1} ellipsizeMode="tail">
+        <Text style={[styles.leagueName, { color: colors.text }]} numberOfLines={1} ellipsizeMode="tail">
           {item.name}
         </Text>
         <View style={styles.leagueDetails}>
@@ -120,57 +128,84 @@ export default function LeaguesTab() {
             <Image
               source={require('@/assets/images/fantasy pawns/15.png')}
               style={styles.detailIcon}
-              tintColor="#94a3b8"
+              tintColor={colors.textSecondary}
             />
-            <Text style={styles.detailText}>{item.max_members} members</Text>
+            <Text style={[styles.detailText, { color: colors.textSecondary }]}>{item.max_members} members</Text>
           </View>
-          <Text style={styles.detailText}>📋 {item.picks_per_person} picks</Text>
+          <Text style={[styles.detailText, { color: colors.textSecondary }]}>📋 {item.picks_per_person} picks</Text>
         </View>
       </View>
-      <View style={styles.leagueTypeBadge}>
-        <Text style={styles.leagueTypeText}>{getLeagueTypeLabel(item)}</Text>
+      <View style={[styles.leagueTypeBadge, { borderColor: colors.primary }]}>
+        <Text style={[styles.leagueTypeText, { color: colors.text }]}>{getLeagueTypeLabel(item)}</Text>
       </View>
     </TouchableOpacity>
   );
 
   if (loading) {
     return (
-      <View style={styles.container}>
-        <View style={styles.centerContent}>
-          <Text style={styles.loadingText}>Loading leagues...</Text>
-        </View>
+      <View style={[styles.container, { backgroundColor: colors.background }]}>
+        <SkeletonLoader type="league" count={4} />
       </View>
     );
   }
 
   return (
-    <View style={styles.container}>
-      {leagues.length === 0 ? (
-        <View style={styles.centerContent}>
-          <Text style={styles.emptyTitle}>No Leagues Yet</Text>
-          <Text style={styles.emptyText}>Create or join a league to get started!</Text>
+    <View style={[styles.container, { backgroundColor: colors.background }]}>
+      {!leaguesPageData || leaguesPageData.length === 0 ? (
+        <ScrollView
+          contentContainerStyle={styles.emptyStateContent}
+          refreshControl={
+            <RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={colors.primary} />
+          }
+        >
           <TouchableOpacity
-            style={styles.createButton}
-            onPress={() => router.push('/create-league')}
+            style={[styles.publicLeaguesCard, { backgroundColor: colors.cardBackground, borderColor: colors.border, marginBottom: 24, marginTop: 16 }]}
+            onPress={() => router.push('/public-leagues')}
+          >
+            <Text style={styles.publicLeaguesIcon}>🌐</Text>
+            <View style={styles.publicLeaguesInfo}>
+              <Text style={[styles.publicLeaguesTitle, { color: colors.text }]}>Browse Public Leagues</Text>
+              <Text style={[styles.publicLeaguesSubtitle, { color: colors.textSecondary }]}>Discover and join leagues from the community</Text>
+            </View>
+            <Text style={[styles.publicLeaguesArrow, { color: colors.textTertiary }]}>›</Text>
+          </TouchableOpacity>
+          <Text style={[styles.emptyTitle, { color: colors.text }]}>No Leagues Yet</Text>
+          <Text style={[styles.emptyText, { color: colors.textSecondary }]}>Create or join a league to get started!</Text>
+          <TouchableOpacity
+            style={[styles.createButton, { backgroundColor: colors.primary }]}
+            onPress={() => router.push('/create-league?from=leagues')}
           >
             <Text style={styles.createButtonText}>Create League</Text>
           </TouchableOpacity>
-        </View>
+        </ScrollView>
       ) : (
         <>
           <FlatList
-            data={leagues}
+            data={leaguesPageData}
             renderItem={renderLeague}
             keyExtractor={(item) => item.id}
             contentContainerStyle={styles.listContent}
             refreshControl={
-              <RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor="#2563eb" />
+              <RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={colors.primary} />
+            }
+            ListHeaderComponent={
+              <TouchableOpacity
+                style={[styles.publicLeaguesCard, { backgroundColor: colors.cardBackground, borderColor: colors.border }]}
+                onPress={() => router.push('/public-leagues')}
+              >
+                <Text style={styles.publicLeaguesIcon}>🌐</Text>
+                <View style={styles.publicLeaguesInfo}>
+                  <Text style={[styles.publicLeaguesTitle, { color: colors.text }]}>Browse Public Leagues</Text>
+                  <Text style={[styles.publicLeaguesSubtitle, { color: colors.textSecondary }]}>Discover and join leagues from the community</Text>
+                </View>
+                <Text style={[styles.publicLeaguesArrow, { color: colors.textTertiary }]}>›</Text>
+              </TouchableOpacity>
             }
           />
-          <View style={styles.bottomButtonContainer}>
+          <View style={[styles.bottomButtonContainer, { backgroundColor: colors.background }]}>
             <TouchableOpacity
-              style={styles.bottomButton}
-              onPress={() => router.push('/create-league')}
+              style={[styles.bottomButton, { backgroundColor: colors.primary }]}
+              onPress={() => router.push('/create-league?from=leagues')}
             >
               <Text style={styles.bottomButtonText}>+ Create League</Text>
             </TouchableOpacity>
@@ -191,6 +226,11 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     alignItems: 'center',
     padding: 20,
+  },
+  emptyStateContent: {
+    alignItems: 'center',
+    padding: 20,
+    paddingTop: 0,
   },
   loadingText: {
     color: '#94a3b8',
@@ -240,6 +280,7 @@ const styles = StyleSheet.create({
   },
   leagueInfo: {
     flex: 1,
+    paddingRight: 100, // Prevent overlap with badge
   },
   leagueName: {
     fontSize: 18,
@@ -301,5 +342,37 @@ const styles = StyleSheet.create({
     color: '#fff',
     fontSize: 16,
     fontWeight: 'bold',
+  },
+  publicLeaguesCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#1e293b',
+    borderRadius: 16,
+    padding: 16,
+    marginBottom: 16,
+    borderWidth: 1,
+    borderColor: '#334155',
+  },
+  publicLeaguesIcon: {
+    fontSize: 32,
+    marginRight: 12,
+  },
+  publicLeaguesInfo: {
+    flex: 1,
+  },
+  publicLeaguesTitle: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#fff',
+    marginBottom: 4,
+  },
+  publicLeaguesSubtitle: {
+    fontSize: 13,
+    color: '#94a3b8',
+  },
+  publicLeaguesArrow: {
+    fontSize: 24,
+    color: '#64748b',
+    marginLeft: 8,
   },
 });

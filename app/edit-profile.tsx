@@ -1,7 +1,8 @@
 import React, { useState } from 'react';
 import { View, Text, StyleSheet, TextInput, TouchableOpacity, Alert, ActivityIndicator, Image } from 'react-native';
-import { useRouter } from 'expo-router';
+import { useRouter, useLocalSearchParams } from 'expo-router';
 import { useAuth } from '@/contexts/AuthContext';
+import { useTheme } from '@/contexts/ThemeContext';
 import { supabase } from '@/lib/supabase';
 
 const PAWN_COLORS = [
@@ -16,8 +17,10 @@ const PAWN_COLORS = [
 ];
 
 export default function EditProfileScreen() {
-  const { profile, refreshProfile } = useAuth();
   const router = useRouter();
+  const { from } = useLocalSearchParams();
+  const { profile, refreshProfile } = useAuth();
+  const { colors } = useTheme();
   const [username, setUsername] = useState(profile?.username || '');
   const [pawnColor, setPawnColor] = useState((profile as any)?.pawn_color || '#2563eb');
   const [loading, setLoading] = useState(false);
@@ -29,7 +32,7 @@ export default function EditProfileScreen() {
     }
 
     if (username === profile?.username && pawnColor === (profile as any)?.pawn_color) {
-      router.back();
+      router.push('/(tabs)/profile');
       return;
     }
 
@@ -64,7 +67,7 @@ export default function EditProfileScreen() {
 
       await refreshProfile();
       Alert.alert('Success', 'Profile updated successfully');
-      router.back();
+      router.push('/(tabs)/profile');
     } catch (error: any) {
       Alert.alert('Error', error.message || 'Failed to update profile');
     } finally {
@@ -73,23 +76,23 @@ export default function EditProfileScreen() {
   };
 
   return (
-    <View style={styles.container}>
-      <View style={styles.header}>
-        <TouchableOpacity onPress={() => router.back()} style={styles.backButton}>
-          <Text style={styles.backButtonText}>Cancel</Text>
+    <View style={[styles.container, { backgroundColor: colors.background }]}>
+      <View style={[styles.header, { backgroundColor: colors.headerBackground, borderBottomColor: colors.border }]}>
+        <TouchableOpacity onPress={() => router.push('/(tabs)/profile')} style={styles.backButton}>
+          <Text style={[styles.backButtonText, { color: colors.primary }]}>Cancel</Text>
         </TouchableOpacity>
-        <Text style={styles.headerTitle}>Edit Profile</Text>
+        <Text style={[styles.headerTitle, { color: colors.text }]}>Edit Profile</Text>
         <TouchableOpacity onPress={handleSave} style={styles.saveButton} disabled={loading}>
           {loading ? (
-            <ActivityIndicator color="#2563eb" />
+            <ActivityIndicator color={colors.primary} />
           ) : (
-            <Text style={styles.saveButtonText}>Save</Text>
+            <Text style={[styles.saveButtonText, { color: colors.primary }]}>Save</Text>
           )}
         </TouchableOpacity>
       </View>
 
       <View style={styles.content}>
-        <View style={styles.avatar}>
+        <View style={[styles.avatar, { backgroundColor: colors.cardBackground, borderColor: colors.border }]}>
           <Image
             source={require('@/assets/images/fantasy pawns/13.png')}
             style={styles.pawnAvatar}
@@ -98,23 +101,23 @@ export default function EditProfileScreen() {
         </View>
 
         <View style={styles.formSection}>
-          <Text style={styles.label}>Username</Text>
+          <Text style={[styles.label, { color: colors.text }]}>Username</Text>
           <TextInput
-            style={styles.input}
+            style={[styles.input, { backgroundColor: colors.cardBackground, borderColor: colors.border, color: colors.text }]}
             value={username}
             onChangeText={setUsername}
             placeholder="Enter username"
-            placeholderTextColor="#64748b"
+            placeholderTextColor={colors.textTertiary}
             autoCapitalize="none"
             autoCorrect={false}
           />
-          <Text style={styles.helperText}>
+          <Text style={[styles.helperText, { color: colors.textSecondary }]}>
             This is how other players will see you in leagues
           </Text>
         </View>
 
         <View style={styles.formSection}>
-          <Text style={styles.label}>Pawn Color</Text>
+          <Text style={[styles.label, { color: colors.text }]}>Pawn Color</Text>
           <View style={styles.colorGrid}>
             {PAWN_COLORS.map((item) => (
               <TouchableOpacity
@@ -132,7 +135,7 @@ export default function EditProfileScreen() {
               </TouchableOpacity>
             ))}
           </View>
-          <Text style={styles.helperText}>
+          <Text style={[styles.helperText, { color: colors.textSecondary }]}>
             Choose your pawn color for your profile avatar
           </Text>
         </View>

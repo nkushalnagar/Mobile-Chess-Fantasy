@@ -1,8 +1,12 @@
-import React, { useEffect, useState } from 'react';
-import { View, Text, StyleSheet, ScrollView, TouchableOpacity, Dimensions, Image, TextInput, Modal, ActivityIndicator, Linking } from 'react-native';
+import React, { useEffect, useState, useCallback, useRef } from 'react';
+import { View, Text, StyleSheet, ScrollView, TouchableOpacity, Dimensions, Image, TextInput, Modal, ActivityIndicator, KeyboardAvoidingView, Platform, Switch, Animated, RefreshControl } from 'react-native';
+import * as WebBrowser from 'expo-web-browser';
 import { useAuth } from '@/contexts/AuthContext';
+import { useTheme } from '@/contexts/ThemeContext';
+import { useDataCache } from '@/contexts/DataCacheContext';
 import { useRouter } from 'expo-router';
 import { supabase } from '@/lib/supabase';
+import SkeletonLoader from '@/components/SkeletonLoader';
 
 const SCREEN_WIDTH = Dimensions.get('window').width;
 const CARD_WIDTH = SCREEN_WIDTH - 60; // 20px padding on each side + 20px for next card peek
@@ -33,6 +37,18 @@ interface League {
   max_player_rating?: number;
 }
 
+interface Tournament {
+  id: string;
+  name: string;
+  start_date: string;
+  end_date: string;
+  location?: string;
+  time_control?: string;
+  status: string;
+  is_active?: boolean;
+  icon_url?: string;
+}
+
 interface NewsPost {
   id: string;
   title: string;
@@ -60,35 +76,212 @@ interface Comment {
 }
 
 const REACTION_EMOJIS: Record<string, string> = {
-  like: '👍',
   love: '❤️',
   fire: '🔥',
   thinking: '🤔',
   celebrate: '🎉',
   sad: '😢',
+  dislike: '👎',
 };
 
 export default function HomeTab() {
   const { profile } = useAuth();
+  const { theme, colors, toggleTheme } = useTheme();
+  const { leagues, setLeagues, tournaments, setTournaments, newsPosts, setNewsPosts } = useDataCache();
   const router = useRouter();
-  const [leagues, setLeagues] = useState<League[]>([]);
-  const [newsPosts, setNewsPosts] = useState<NewsPost[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [tournamentFilter, setTournamentFilter] = useState<'upcoming' | 'ongoing'>('upcoming');
+  const [tournamentsExpanded, setTournamentsExpanded] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [newsLoading, setNewsLoading] = useState(false);
   const [selectedPost, setSelectedPost] = useState<NewsPost | null>(null);
   const [comments, setComments] = useState<Comment[]>([]);
+  const [commentsLoading, setCommentsLoading] = useState(false);
   const [newComment, setNewComment] = useState('');
+  const [sendingComment, setSendingComment] = useState(false);
+  const commentInputRef = useRef<TextInput>(null);
   const [showReactions, setShowReactions] = useState<string | null>(null);
+  const [showUsernamePrompt, setShowUsernamePrompt] = useState(false);
+  const slideAnim = useState(new Animated.Value(-300))[0];
+  const [refreshing, setRefreshing] = useState(false);
 
   useEffect(() => {
-    fetchLeagues();
-    fetchNewsPosts();
+    // Check if user needs to set username
+    if (profile && !profile.username) {
+      setShowUsernamePrompt(true);
+      // Slide in animation
+      Animated.timing(slideAnim, {
+        toValue: 0,
+        duration: 500,
+        useNativeDriver: true,
+      }).start();
+      
+      // Auto-hide after 5 seconds
+      setTimeout(() => {
+        handleCloseUsernamePrompt();
+      }, 5000);
+    }
   }, [profile]);
+
+  // Real-time subscription for comments when modal is open
+  useEffect(() => {
+    if (!selectedPost || !profile) return;
+
+    const channel = supabase
+      .channel(`comments_${selectedPost.id}`)
+      .on(
+        'postgres_changes',
+        {
+          event: 'INSERT',
+          schema: 'public',
+          table: 'news_comments',
+          filter: `post_id=eq.${selectedPost.id}`,
+        },
+        async (payload) => {
+          const newComment = payload.new as any;
+          
+          // Fetch username for the new comment
+          const { data: profileData } = await supabase
+            .from('profiles')
+            .select('username')
+            .eq('id', newComment.user_id)
+            .single();
+
+          // Add the new comment to the list without showing loading
+          setComments((current) => [{
+            id: newComment.id,
+            content: newComment.content,
+            created_at: newComment.created_at,
+            like_count: newComment.like_count || 0,
+            user: { username: profileData?.username || 'Unknown' },
+            user_liked: false,
+          }, ...current]);
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [selectedPost, profile]);
+
+  const handleCloseUsernamePrompt = () => {
+    Animated.timing(slideAnim, {
+      toValue: -300,
+      duration: 300,
+      useNativeDriver: true,
+    }).start(() => {
+      setShowUsernamePrompt(false);
+    });
+  };
+
+  // Fetch data only if we don't have it yet
+  useEffect(() => {
+    if (profile && leagues === null) {
+      setLoading(true);
+      fetchLeagues();
+    }
+    if (profile && tournaments === null) {
+      fetchUpcomingTournaments();
+    }
+    if (profile && newsPosts === null) {
+      fetchNewsPosts();
+    }
+  }, [profile, leagues, tournaments, newsPosts]);
+
+  // Real-time subscription for comment and reaction updates
+  useEffect(() => {
+    if (!profile) return;
+
+    const channel = supabase
+      .channel('news_updates')
+      .on(
+        'postgres_changes',
+        {
+          event: 'INSERT',
+          schema: 'public',
+          table: 'news_comments',
+        },
+        async (payload) => {
+          const newComment = payload.new as any;
+          const postId = newComment.post_id;
+
+          setNewsPosts((currentPosts) => {
+            if (!currentPosts) return currentPosts;
+            return currentPosts.map((post: NewsPost) => 
+              post.id === postId 
+                ? { ...post, comment_count: (post.comment_count || 0) + 1 }
+                : post
+            );
+          });
+        }
+      )
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'news_reactions',
+        },
+        async (payload) => {
+          const reaction = payload.new as any;
+          const postId = reaction?.post_id || (payload.old as any)?.post_id;
+          if (!postId) return;
+
+          // Refetch reaction counts for this post
+          const { data: allReactions } = await supabase
+            .from('news_reactions')
+            .select('reaction_type')
+            .eq('post_id', postId);
+
+          const { data: userReaction } = await supabase
+            .from('news_reactions')
+            .select('reaction_type')
+            .eq('post_id', postId)
+            .eq('user_id', profile.id)
+            .maybeSingle();
+
+          const reactionCounts: Record<string, number> = {};
+          allReactions?.forEach((r: any) => {
+            reactionCounts[r.reaction_type] = (reactionCounts[r.reaction_type] || 0) + 1;
+          });
+
+          setNewsPosts((currentPosts) => {
+            if (!currentPosts) return currentPosts;
+            return currentPosts.map((post: NewsPost) => 
+              post.id === postId 
+                ? { 
+                    ...post, 
+                    user_reaction: userReaction?.reaction_type || null,
+                    reaction_counts: reactionCounts,
+                    reaction_count: Object.values(reactionCounts).reduce((a, b) => a + b, 0)
+                  }
+                : post
+            );
+          });
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [profile]);
+
+  const onRefresh = useCallback(async () => {
+    setRefreshing(true);
+    await Promise.all([
+      fetchLeagues(),
+      fetchUpcomingTournaments(),
+      fetchNewsPosts()
+    ]);
+    setRefreshing(false);
+  }, []);
 
   const fetchLeagues = async () => {
     if (!profile?.id) return;
 
     try {
-      const { data, error } = await supabase
+      const { data, error} = await supabase
         .from('league_memberships')
         .select(`
           league_id,
@@ -118,7 +311,81 @@ export default function HomeTab() {
     }
   };
 
+  const fetchUpcomingTournaments = async () => {
+    try {
+      const { data, error } = await supabase
+        .from('tournaments')
+        .select('id, name, start_date, end_date, location, time_control, status, is_active, icon_url')
+        .in('status', ['upcoming', 'active'])
+        .order('start_date', { ascending: true })
+        .limit(5);
+
+      if (error) throw error;
+
+      setTournaments(data || []);
+    } catch (error) {
+      console.error('Error fetching tournaments:', error);
+    }
+  };
+
+  const removeDuplicatesAndSimilar = (posts: any[]) => {
+    // Common words to ignore when comparing titles
+    const commonWords = new Set([
+      'the', 'and', 'on', 'a', 'an', 'in', 'to', 'of', 'for', 'with', 'at', 'by', 'from',
+      'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had',
+      'chess', 'win', 'wins', 'won', 'lose', 'loses', 'lost', 'draw', 'draws', 'drew',
+      'player', 'players', 'game', 'games', 'match', 'matches', 'fighting', 'fight', 'fights'
+    ]);
+
+    const normalizeTitle = (title: string) => {
+      return title
+        .toLowerCase()
+        .replace(/[^\w\s]/g, '') // Remove punctuation
+        .split(/\s+/)
+        .filter(word => word.length > 0);
+    };
+
+    const getSignificantWords = (title: string) => {
+      const words = normalizeTitle(title);
+      return words.filter(word => !commonWords.has(word));
+    };
+
+    const areSimilar = (title1: string, title2: string) => {
+      const words1 = getSignificantWords(title1);
+      const words2 = getSignificantWords(title2);
+
+      // Count matching significant words
+      const matches = words1.filter(word => words2.includes(word)).length;
+
+      // If 4+ significant words match, consider them similar
+      return matches >= 4;
+    };
+
+    const uniquePosts: any[] = [];
+    const seenTitles = new Set<string>();
+
+    for (const post of posts) {
+      // Check for exact duplicates
+      if (seenTitles.has(post.title)) {
+        continue;
+      }
+
+      // Check for similar titles
+      const isSimilarToExisting = uniquePosts.some(existingPost => 
+        areSimilar(post.title, existingPost.title)
+      );
+
+      if (!isSimilarToExisting) {
+        uniquePosts.push(post);
+        seenTitles.add(post.title);
+      }
+    }
+
+    return uniquePosts;
+  };
+
   const fetchNewsPosts = async () => {
+    setNewsLoading(true);
     try {
       // Calculate date 2 days ago
       const twoDaysAgo = new Date();
@@ -127,12 +394,17 @@ export default function HomeTab() {
       const { data: posts, error } = await supabase
         .from('news_posts')
         .select('*')
-        .gte('published_at', twoDaysAgo.toISOString());
+        .gte('published_at', twoDaysAgo.toISOString())
+        .order('published_at', { ascending: false }); // Sort by date in database
 
       if (error) throw error;
 
-      // Primary sort: by published_at (newest first), then by engagement
-      const sortedByDateAndEngagement = (posts || []).slice().sort((a: any, b: any) => {
+      // Remove duplicates and similar articles
+      const uniquePosts = removeDuplicatesAndSimilar(posts || []);
+
+      // Sort by date (newest first), then by engagement
+      // Date sorting is the PRIMARY sort - do not disrupt it
+      const finalPosts = uniquePosts.sort((a: any, b: any) => {
         const dateA = new Date(a.published_at).getTime();
         const dateB = new Date(b.published_at).getTime();
         if (dateA !== dateB) {
@@ -141,34 +413,8 @@ export default function HomeTab() {
 
         const engagementA = (a.reaction_count || 0) + (a.comment_count || 0);
         const engagementB = (b.reaction_count || 0) + (b.comment_count || 0);
-        if (engagementA !== engagementB) {
-          return engagementB - engagementA; // Higher engagement first
-        }
-
-        return 0;
+        return engagementB - engagementA;
       });
-
-      // Tertiary preference: alternate between sources while mostly preserving sorted order
-      const alternatedPosts: any[] = [];
-      const remaining = [...sortedByDateAndEngagement];
-      let lastSource: string | null = null;
-
-      while (remaining.length > 0) {
-        let indexToTake = 0;
-
-        if (lastSource) {
-          const altIndex = remaining.findIndex(p => p.source !== lastSource);
-          if (altIndex !== -1) {
-            indexToTake = altIndex;
-          }
-        }
-
-        const [next] = remaining.splice(indexToTake, 1);
-        alternatedPosts.push(next);
-        lastSource = next?.source || null;
-      }
-
-      const finalPosts = alternatedPosts;
 
       // Fetch user's reactions and reaction counts for these posts
       if (profile?.id && finalPosts.length > 0) {
@@ -208,56 +454,77 @@ export default function HomeTab() {
       }
     } catch (error) {
       console.error('Error fetching news posts:', error);
+    } finally {
+      setNewsLoading(false);
     }
   };
 
   const handleReaction = async (postId: string, reactionType: string) => {
-    if (!profile?.id) return;
-
     try {
-      const post = newsPosts.find(p => p.id === postId);
+      const post = newsPosts?.find(p => p.id === postId);
+      if (!post) return;
       
-      if (post?.user_reaction === reactionType) {
+      const oldReaction = post.user_reaction;
+      const oldCounts = { ...post.reaction_counts };
+      
+      // Optimistically update UI
+      setNewsPosts((currentPosts) => {
+        if (!currentPosts) return currentPosts;
+        return currentPosts.map((p: NewsPost) => {
+          if (p.id !== postId) return p;
+          
+          const newCounts = { ...p.reaction_counts };
+          
+          // Remove old reaction count
+          if (oldReaction) {
+            newCounts[oldReaction] = Math.max(0, (newCounts[oldReaction] || 0) - 1);
+          }
+          
+          // Add new reaction count or remove if same
+          if (oldReaction === reactionType) {
+            return { ...p, user_reaction: null, reaction_counts: newCounts };
+          } else {
+            newCounts[reactionType] = (newCounts[reactionType] || 0) + 1;
+            return { ...p, user_reaction: reactionType, reaction_counts: newCounts };
+          }
+        });
+      });
+      
+      if (oldReaction === reactionType) {
         // Remove reaction if clicking the same one
         await supabase
           .from('news_reactions')
           .delete()
           .eq('post_id', postId)
-          .eq('user_id', profile.id);
+          .eq('user_id', profile!.id);
       } else {
         // Upsert will update if exists or insert if new
         await supabase
           .from('news_reactions')
           .upsert({
             post_id: postId,
-            user_id: profile.id,
+            user_id: profile!.id,
             reaction_type: reactionType,
           }, {
             onConflict: 'post_id,user_id'
           });
       }
-
-      fetchNewsPosts();
     } catch (error) {
       console.error('Error handling reaction:', error);
+      // Revert on error
+      fetchNewsPosts();
     }
   };
 
   const openComments = async (post: NewsPost) => {
     setSelectedPost(post);
-    
+    setNewComment(''); // Clear input when opening modal
+    setCommentsLoading(true);
     try {
       const { data: commentsData, error } = await supabase
         .from('news_comments')
-        .select(`
-          id,
-          content,
-          created_at,
-          like_count,
-          user_id
-        `)
+        .select('*')
         .eq('post_id', post.id)
-        .is('parent_comment_id', null)
         .order('created_at', { ascending: false });
 
       if (error) throw error;
@@ -311,11 +578,17 @@ export default function HomeTab() {
     } catch (error) {
       console.error('Error fetching comments:', error);
       setComments([]);
+    } finally {
+      setCommentsLoading(false);
     }
   };
 
   const postComment = async () => {
-    if (!profile?.id || !selectedPost || !newComment.trim()) return;
+    if (!profile?.id || !selectedPost || !newComment.trim() || sendingComment) return;
+
+    const commentText = newComment.trim();
+    setSendingComment(true);
+    setNewComment('');
 
     try {
       await supabase
@@ -323,14 +596,14 @@ export default function HomeTab() {
         .insert({
           post_id: selectedPost.id,
           user_id: profile.id,
-          content: newComment.trim(),
+          content: commentText,
         });
 
-      setNewComment('');
-      openComments(selectedPost);
-      fetchNewsPosts();
+      // Real-time subscription will handle adding the comment to the list
     } catch (error) {
       console.error('Error posting comment:', error);
+    } finally {
+      setSendingComment(false);
     }
   };
 
@@ -381,9 +654,64 @@ export default function HomeTab() {
   };
 
   return (
-    <ScrollView style={styles.container}>
+    <ScrollView 
+      style={[styles.container, { backgroundColor: colors.background }]}
+      refreshControl={
+        <RefreshControl
+          refreshing={refreshing}
+          onRefresh={onRefresh}
+          tintColor={colors.primary}
+          colors={[colors.primary]}
+        />
+      }
+    >
       <View style={styles.content}>
-        <Text style={styles.greeting}>Hey {profile?.username}! 👋</Text>
+        <View style={styles.header}>
+          <Text style={[styles.greeting, { color: colors.primaryLight }]}>Hey {profile?.username}! 👋</Text>
+          <View style={styles.themeToggle}>
+            <Text style={[styles.themeLabel, { color: colors.textSecondary }]}>
+              {theme === 'dark' ? '🌙' : '☀️'}
+            </Text>
+            <Switch
+              value={theme === 'light'}
+              onValueChange={toggleTheme}
+              trackColor={{ false: colors.border, true: colors.primary }}
+              thumbColor={theme === 'light' ? '#fff' : '#f4f3f4'}
+            />
+          </View>
+        </View>
+
+        {/* Username Setup Prompt - Slide-out Banner */}
+        {showUsernamePrompt && (
+          <Animated.View 
+            style={[
+              styles.usernamePromptBanner,
+              { 
+                backgroundColor: colors.primary,
+                transform: [{ translateY: slideAnim }]
+              }
+            ]}
+          >
+            <View style={styles.usernamePromptContent}>
+              <Text style={styles.usernamePromptIcon}>👤</Text>
+              <View style={styles.usernamePromptTextContainer}>
+                <Text style={styles.usernamePromptTitle}>Set Your Username</Text>
+                <Text style={styles.usernamePromptSubtitle}>
+                  Choose a username in Profile Settings
+                </Text>
+              </View>
+              <TouchableOpacity 
+                onPress={() => {
+                  handleCloseUsernamePrompt();
+                  router.push('/profile');
+                }}
+                style={styles.usernamePromptButton}
+              >
+                <Text style={styles.usernamePromptButtonText}>Go →</Text>
+              </TouchableOpacity>
+            </View>
+          </Animated.View>
+        )}
 
         {/* Leagues Carousel */}
         <View style={styles.carouselSection}>
@@ -394,7 +722,7 @@ export default function HomeTab() {
             decelerationRate="fast"
             contentContainerStyle={styles.carouselContent}
           >
-            {leagues.map((league) => {
+            {leagues?.map((league) => {
               const getLeagueTypeLabel = () => {
                 if (league.league_type === 'season') {
                   if (league.min_player_rating) {
@@ -408,8 +736,8 @@ export default function HomeTab() {
               return (
                 <TouchableOpacity
                   key={league.id}
-                  style={styles.leagueCard}
-                  onPress={() => router.push(`/league/${league.id}`)}
+                  style={[styles.leagueCard, { backgroundColor: colors.cardBackground, borderColor: colors.border }]}
+                  onPress={() => router.push(`/league/${league.id}?from=home`)}
                 >
                   <Image
                     source={getEmblemForLeague(league.id)}
@@ -417,29 +745,42 @@ export default function HomeTab() {
                     resizeMode="contain"
                   />
                   <View style={styles.leagueInfo}>
-                    <Text style={styles.leagueName} numberOfLines={1} ellipsizeMode="tail">
+                    <Text style={[styles.leagueName, { color: colors.text }]} numberOfLines={1} ellipsizeMode="tail">
                       {league.name}
                     </Text>
                     <View style={styles.membersRow}>
                       <Image
                         source={require('@/assets/images/fantasy pawns/15.png')}
                         style={styles.membersIcon}
-                        tintColor="#94a3b8"
+                        tintColor={colors.textSecondary}
                       />
-                      <Text style={styles.detailText}>{league.max_members} members</Text>
+                      <Text style={[styles.detailText, { color: colors.textSecondary }]}>{league.max_members} members</Text>
                     </View>
                   </View>
-                  <View style={styles.leagueTypeBadge}>
-                    <Text style={styles.leagueTypeText}>{getLeagueTypeLabel()}</Text>
+                  <View style={[styles.leagueTypeBadge, { borderColor: colors.primary }]}>
+                    <Text style={[styles.leagueTypeText, { color: colors.text }]}>{getLeagueTypeLabel()}</Text>
                   </View>
                 </TouchableOpacity>
               );
             })}
             
+            {/* Public Leagues Card */}
+            <TouchableOpacity
+              style={[styles.leagueCard, styles.publicLeaguesCard, { backgroundColor: colors.cardBackground, borderColor: colors.borderLight }]}
+              onPress={() => router.push('/public-leagues?from=home')}
+            >
+              <Text style={styles.publicLeaguesIcon}>🌐</Text>
+              <View style={styles.publicLeaguesCardInfo}>
+                <Text style={[styles.publicLeaguesCardTitle, { color: colors.text }]}>Browse Public Leagues</Text>
+                <Text style={[styles.publicLeaguesCardSubtitle, { color: colors.textSecondary }]}>Join community leagues</Text>
+              </View>
+              <Text style={[styles.publicLeaguesArrow, { color: colors.textTertiary }]}>›</Text>
+            </TouchableOpacity>
+
             {/* Create League Card */}
             <TouchableOpacity
-              style={[styles.leagueCard, styles.createLeagueCard]}
-              onPress={() => router.push('/create-league')}
+              style={[styles.leagueCard, styles.createLeagueCard, { backgroundColor: colors.primary, borderColor: colors.primary }]}
+              onPress={() => router.push('/create-league?from=home')}
             >
               <Text style={styles.createLeagueIcon}>+</Text>
               <Text style={styles.createLeagueText}>Create League</Text>
@@ -447,20 +788,177 @@ export default function HomeTab() {
           </ScrollView>
         </View>
 
+        {/* Tournaments Section */}
+        {tournaments && tournaments.length > 0 && (
+          <View style={styles.tournamentsSection}>
+            <TouchableOpacity
+              style={[styles.tournamentsSectionHeader, { backgroundColor: colors.cardBackground, borderColor: colors.border }]}
+              onPress={() => setTournamentsExpanded(!tournamentsExpanded)}
+              activeOpacity={0.7}
+            >
+              <View style={styles.headerLeft}>
+                <Text style={[styles.tournamentsSectionTitle, { color: colors.text }]}>Tournaments</Text>
+              </View>
+              <View style={styles.headerRight}>
+                <TouchableOpacity
+                  style={[styles.filterBadge, { backgroundColor: colors.primary }]}
+                  onPress={(e) => {
+                    e.stopPropagation();
+                    setTournamentFilter(tournamentFilter === 'upcoming' ? 'ongoing' : 'upcoming');
+                  }}
+                >
+                  <Text style={styles.filterBadgeText}>
+                    {tournamentFilter === 'upcoming' ? 'Upcoming' : 'Ongoing'}
+                  </Text>
+                </TouchableOpacity>
+                <Text style={[styles.expandArrow, { color: colors.textSecondary }, tournamentsExpanded && styles.expandArrowRotated]}>
+                  ›
+                </Text>
+              </View>
+            </TouchableOpacity>
+            
+            {tournamentsExpanded && tournaments
+              ?.filter((t) =>
+                tournamentFilter === 'upcoming'
+                  ? t.status === 'upcoming'
+                  : t.status === 'active'
+              )
+              .map((tournament) => {
+              const startDate = new Date(tournament.start_date);
+              const endDate = new Date(tournament.end_date);
+              const isActive = tournament.status === 'active';
+              
+              const formatTournamentDate = (date: Date) => {
+                return date.toLocaleDateString('en-US', { 
+                  month: 'short', 
+                  day: 'numeric',
+                  year: 'numeric'
+                });
+              };
+
+              const isUpcoming = tournament.status === 'upcoming';
+              const isDraftable = isUpcoming && tournament.is_active;
+              const CardWrapper = isActive ? TouchableOpacity : View;
+              const cardProps = isActive
+                ? {
+                    onPress: () => router.push(`/(tabs)/feed?tournament_id=${tournament.id}`),
+                    activeOpacity: 0.7,
+                  }
+                : {};
+
+              // Calculate days until tournament starts
+              const daysUntilStart = isUpcoming 
+                ? Math.ceil((startDate.getTime() - Date.now()) / (1000 * 60 * 60 * 24))
+                : 0;
+              
+              // Determine countdown color based on days remaining
+              const getCountdownColor = () => {
+                if (daysUntilStart <= 2) return '#ef4444'; // Red - very close
+                if (daysUntilStart <= 7) return '#f59e0b'; // Orange - medium
+                return '#10b981'; // Green - far away
+              };
+
+              const getCountdownText = () => {
+                if (daysUntilStart === 0) return 'Today';
+                if (daysUntilStart === 1) return 'Tomorrow';
+                return `${daysUntilStart}d`;
+              };
+
+              // Use icon_url from database
+              const hasIcon = tournament.icon_url;
+
+              return (
+                <TouchableOpacity 
+                  key={tournament.id}
+                  onPress={() => router.push(`/tournament/${tournament.id}`)}
+                  activeOpacity={0.7}
+                >
+                  <CardWrapper style={[styles.tournamentCard, { backgroundColor: colors.cardBackground, borderColor: colors.border }]} {...cardProps}>
+                    <View style={styles.tournamentHeader}>
+                    <View style={styles.tournamentTitleRow}>
+                      {hasIcon ? (
+                        <Image
+                          source={{ uri: tournament.icon_url }}
+                          style={styles.tournamentLogo}
+                          resizeMode="contain"
+                        />
+                      ) : (
+                        <Text style={styles.tournamentIcon}>🏆</Text>
+                      )}
+                      <Text style={[styles.tournamentName, { color: colors.text }]} numberOfLines={2}>
+                        {tournament.name}
+                      </Text>
+                    </View>
+                    <View style={styles.badgeContainer}>
+                      {isActive && (
+                        <View style={styles.activeBadge}>
+                          <Text style={styles.activeBadgeText}>LIVE</Text>
+                        </View>
+                      )}
+                      {isUpcoming && (
+                        <View style={[styles.countdownBadge, { backgroundColor: getCountdownColor() }]}>
+                          <Text style={styles.countdownText}>{getCountdownText()}</Text>
+                        </View>
+                      )}
+                      {isDraftable && (
+                        <TouchableOpacity
+                          style={styles.draftButton}
+                          onPress={() => router.push('/(tabs)/leagues')}
+                        >
+                          <Text style={styles.draftButtonText}>Draft Now</Text>
+                          <Text style={styles.draftButtonArrow}>→</Text>
+                        </TouchableOpacity>
+                      )}
+                    </View>
+                  </View>
+                  
+                  <View style={styles.tournamentDetails}>
+                    <View style={styles.tournamentDetailRow}>
+                      <Text style={styles.tournamentDetailIcon}>📅</Text>
+                      <Text style={[styles.tournamentDetailText, { color: colors.textSecondary }]}>
+                        {formatTournamentDate(startDate)} - {formatTournamentDate(endDate)}
+                      </Text>
+                    </View>
+                    
+                    {tournament.location && (
+                      <View style={styles.tournamentDetailRow}>
+                        <Text style={styles.tournamentDetailIcon}>📍</Text>
+                        <Text style={[styles.tournamentDetailText, { color: colors.textSecondary }]}>{tournament.location}</Text>
+                      </View>
+                    )}
+                    
+                    {tournament.time_control && (
+                      <View style={styles.tournamentDetailRow}>
+                        <Text style={styles.tournamentDetailIcon}>⏱️</Text>
+                        <Text style={[styles.tournamentDetailText, { color: colors.textSecondary }]}>
+                          {tournament.time_control.charAt(0).toUpperCase() + tournament.time_control.slice(1)}
+                        </Text>
+                      </View>
+                    )}
+                  </View>
+                </CardWrapper>
+              </TouchableOpacity>
+              );
+            })}
+          </View>
+        )}
+
         {/* Feed Section */}
         <View style={styles.feedSection}>
-          {newsPosts.map((post, index) => (
-            <View key={post.id} style={styles.card}>
+          {newsLoading ? (
+            <SkeletonLoader type="card" count={3} />
+          ) : newsPosts?.map((post, index) => (
+            <View key={post.id} style={[styles.card, { backgroundColor: colors.cardBackground, borderColor: colors.border }]}>
               <View style={styles.cardHeader}>
                 <View style={[styles.sourceBadge, { backgroundColor: getSourceColor(post.source) }]}>
                   <Text style={styles.sourceBadgeText}>
                     {post.source}
                   </Text>
                 </View>
-                <Text style={styles.dateText}>{formatDate(post.published_at)}</Text>
+                <Text style={[styles.dateText, { color: colors.textSecondary }]}>{formatDate(post.published_at)}</Text>
               </View>
               
-              <Text style={styles.cardTitle}>
+              <Text style={[styles.cardTitle, { color: colors.text }]}>
                 {(() => {
                   // Clean title by taking only the first occurrence if duplicated
                   const titleParts = post.title.split(/\n\s*\n/); // Split by double newlines
@@ -468,7 +966,7 @@ export default function HomeTab() {
                   return uniqueTitle;
                 })()}
               </Text>
-              <Text style={styles.cardText}>
+              <Text style={[styles.cardText, { color: colors.textSecondary }]}>
                 {(() => {
                   let content = post.content;
                   // Get the cleaned title
@@ -489,9 +987,9 @@ export default function HomeTab() {
               {post.link && (
                 <TouchableOpacity 
                   style={styles.linkButton}
-                  onPress={() => post.link && Linking.openURL(post.link)}
+                  onPress={() => post.link && WebBrowser.openBrowserAsync(post.link)}
                 >
-                  <Text style={styles.linkText}>Read more →</Text>
+                  <Text style={[styles.linkText, { color: colors.primary }]}>Read more →</Text>
                 </TouchableOpacity>
               )}
 
@@ -504,12 +1002,20 @@ export default function HomeTab() {
                   return (
                     <TouchableOpacity
                       key={type}
-                      style={[styles.reactionButton, isActive && styles.reactionButtonActive]}
+                      style={[
+                        styles.reactionButton, 
+                        { backgroundColor: isActive ? colors.primary : colors.cardBackground },
+                        isActive && styles.reactionButtonActive
+                      ]}
                       onPress={() => handleReaction(post.id, type)}
                     >
                       <Text style={styles.reactionEmoji}>{emoji}</Text>
                       {count > 0 && (
-                        <Text style={[styles.reactionCount, isActive && styles.reactionCountActive]}>
+                        <Text style={[
+                          styles.reactionCount, 
+                          { color: isActive ? '#fff' : colors.textSecondary },
+                          isActive && styles.reactionCountActive
+                        ]}>
                           {count}
                         </Text>
                       )}
@@ -524,7 +1030,7 @@ export default function HomeTab() {
                 onPress={() => openComments(post)}
               >
                 <Text style={styles.engagementIcon}>💬</Text>
-                <Text style={styles.engagementText}>{post.comment_count} comments</Text>
+                <Text style={[styles.engagementText, { color: colors.textSecondary }]}>{post.comment_count || 0} comments</Text>
               </TouchableOpacity>
             </View>
           ))}
@@ -537,55 +1043,68 @@ export default function HomeTab() {
           transparent={true}
           onRequestClose={() => setSelectedPost(null)}
         >
-          <View style={styles.modalOverlay}>
-            <View style={styles.modalContent}>
-              <View style={styles.modalHeader}>
-                <Text style={styles.modalTitle}>Comments</Text>
+          <KeyboardAvoidingView 
+            behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+            style={[styles.modalOverlay, { backgroundColor: colors.modalOverlay }]}
+          >
+            <View style={[styles.modalContent, { backgroundColor: colors.background }]}>
+              <View style={[styles.modalHeader, { borderBottomColor: colors.border }]}>
+                <Text style={[styles.modalTitle, { color: colors.text }]}>Comments</Text>
                 <TouchableOpacity onPress={() => setSelectedPost(null)}>
-                  <Text style={styles.closeButton}>✕</Text>
+                  <Text style={[styles.closeButton, { color: colors.text }]}>✕</Text>
                 </TouchableOpacity>
               </View>
 
-              <ScrollView style={styles.commentsContainer}>
-                {comments.map((comment) => (
-                  <View key={comment.id} style={styles.commentCard}>
-                    <View style={styles.commentHeader}>
-                      <Text style={styles.commentUsername}>@{comment.user.username}</Text>
-                      <Text style={styles.commentDate}>{formatDate(comment.created_at)}</Text>
+              <ScrollView 
+                style={styles.commentsContainer}
+              >
+                {commentsLoading ? (
+                  <>
+                    {[1, 2, 3].map((i) => (
+                      <View key={i} style={[styles.commentCard, { backgroundColor: colors.cardBackground, borderColor: colors.border }]}>
+                        <View style={styles.commentHeader}>
+                          <View style={[styles.skeletonBox, { width: 100, height: 16, backgroundColor: colors.border }]} />
+                          <View style={[styles.skeletonBox, { width: 60, height: 12, backgroundColor: colors.border }]} />
+                        </View>
+                        <View style={[styles.skeletonBox, { width: '100%', height: 40, marginTop: 8, backgroundColor: colors.border }]} />
+                      </View>
+                    ))}
+                  </>
+                ) : comments.length > 0 ? (
+                  comments.map((comment) => (
+                    <View key={comment.id} style={[styles.commentCard, { backgroundColor: colors.cardBackground, borderColor: colors.border }]}>
+                      <View style={styles.commentHeader}>
+                        <Text style={[styles.commentUsername, { color: colors.primary }]}>@{comment.user.username}</Text>
+                        <Text style={[styles.commentDate, { color: colors.textSecondary }]}>{formatDate(comment.created_at)}</Text>
+                      </View>
+                      <Text style={[styles.commentContent, { color: colors.text }]}>{comment.content}</Text>
                     </View>
-                    <Text style={styles.commentContent}>{comment.content}</Text>
-                    <TouchableOpacity 
-                      style={styles.commentLikeButton}
-                      onPress={() => toggleCommentLike(comment.id)}
-                    >
-                      <Text style={styles.commentLikeIcon}>
-                        {comment.user_liked ? '❤️' : '🤍'}
-                      </Text>
-                      <Text style={styles.commentLikeText}>{comment.like_count}</Text>
-                    </TouchableOpacity>
+                  ))
+                ) : (
+                  <View style={styles.emptyCommentsContainer}>
+                    <Text style={[styles.emptyCommentsText, { color: colors.textSecondary }]}>No comments yet. Be the first to comment!</Text>
                   </View>
-                ))}
+                )}
               </ScrollView>
 
-              <View style={styles.commentInputContainer}>
+              <View style={[styles.commentInputContainer, { backgroundColor: colors.cardBackground, borderTopColor: colors.border }]}>
                 <TextInput
-                  style={styles.commentInput}
+                  ref={commentInputRef}
+                  style={[styles.commentInputFullWidth, { backgroundColor: colors.background, borderColor: colors.border, color: colors.text }]}
                   placeholder="Write a comment..."
-                  placeholderTextColor="#64748b"
+                  placeholderTextColor={colors.textTertiary}
                   value={newComment}
                   onChangeText={setNewComment}
-                  multiline
+                  maxLength={500}
+                  keyboardAppearance={colors.background === '#0f172a' ? 'dark' : 'light'}
+                  returnKeyType="send"
+                  enablesReturnKeyAutomatically={true}
+                  blurOnSubmit={false}
+                  onSubmitEditing={postComment}
                 />
-                <TouchableOpacity 
-                  style={styles.sendButton}
-                  onPress={postComment}
-                  disabled={!newComment.trim()}
-                >
-                  <Text style={styles.sendButtonText}>Send</Text>
-                </TouchableOpacity>
               </View>
             </View>
-          </View>
+          </KeyboardAvoidingView>
         </Modal>
       </View>
     </ScrollView>
@@ -601,12 +1120,25 @@ const styles = StyleSheet.create({
     paddingTop: 20,
     paddingBottom: 20,
   },
+  header: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingHorizontal: 20,
+    marginBottom: 20,
+  },
   greeting: {
     fontSize: 14,
     fontWeight: '500',
     color: '#93c5fd',
-    marginBottom: 20,
-    paddingHorizontal: 20,
+  },
+  themeToggle: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  themeLabel: {
+    fontSize: 18,
   },
   carouselSection: {
     marginBottom: 32,
@@ -677,6 +1209,35 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     color: '#fff',
     textTransform: 'uppercase',
+  },
+  publicLeaguesCard: {
+    backgroundColor: '#334155',
+    borderColor: '#475569',
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 20,
+  },
+  publicLeaguesIcon: {
+    fontSize: 32,
+    marginRight: 12,
+  },
+  publicLeaguesCardInfo: {
+    flex: 1,
+  },
+  publicLeaguesCardTitle: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#fff',
+    marginBottom: 2,
+  },
+  publicLeaguesCardSubtitle: {
+    fontSize: 12,
+    color: '#94a3b8',
+  },
+  publicLeaguesArrow: {
+    fontSize: 24,
+    color: '#64748b',
+    marginLeft: 8,
   },
   createLeagueCard: {
     backgroundColor: '#7c3aed',
@@ -788,7 +1349,6 @@ const styles = StyleSheet.create({
     paddingHorizontal: 8,
     paddingVertical: 4,
     borderRadius: 12,
-    backgroundColor: '#1e293b',
     gap: 3,
   },
   reactionButtonActive: {
@@ -828,7 +1388,7 @@ const styles = StyleSheet.create({
     backgroundColor: '#1e293b',
     borderTopLeftRadius: 20,
     borderTopRightRadius: 20,
-    maxHeight: '80%',
+    height: '80%',
     paddingBottom: 20,
   },
   modalHeader: {
@@ -850,7 +1410,7 @@ const styles = StyleSheet.create({
     fontWeight: '300',
   },
   commentsContainer: {
-    maxHeight: 400,
+    flex: 1,
     padding: 16,
   },
   commentCard: {
@@ -896,7 +1456,6 @@ const styles = StyleSheet.create({
     padding: 16,
     gap: 12,
     borderTopWidth: 1,
-    borderTopColor: '#334155',
   },
   commentInput: {
     flex: 1,
@@ -906,15 +1465,270 @@ const styles = StyleSheet.create({
     color: '#fff',
     maxHeight: 100,
   },
+  commentInputFullWidth: {
+    flex: 1,
+    backgroundColor: '#0f172a',
+    borderRadius: 12,
+    padding: 12,
+    color: '#fff',
+    minHeight: 44,
+  },
   sendButton: {
     backgroundColor: '#2563eb',
     borderRadius: 12,
     paddingHorizontal: 20,
     justifyContent: 'center',
   },
+  sendButtonDisabled: {
+    opacity: 0.5,
+  },
   sendButtonText: {
     color: '#fff',
     fontWeight: '600',
     fontSize: 14,
+  },
+  // Tournament styles
+  tournamentsSection: {
+    paddingHorizontal: 20,
+    paddingTop: 4,
+    paddingBottom: 16,
+  },
+  tournamentsSectionHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    borderRadius: 12,
+    marginBottom: 12,
+    borderWidth: 1,
+  },
+  headerLeft: {
+    justifyContent: 'center',
+  },
+  tournamentsSectionTitle: {
+    fontSize: 18,
+    fontWeight: '700',
+    color: '#fff',
+    fontFamily: 'Montserrat-Bold',
+  },
+  headerRight: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+  },
+  filterBadge: {
+    backgroundColor: '#2563eb',
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 6,
+  },
+  filterBadgeText: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#fff',
+  },
+  expandArrow: {
+    fontSize: 24,
+    fontWeight: 'bold',
+    color: '#94a3b8',
+    transform: [{ rotate: '0deg' }],
+  },
+  expandArrowRotated: {
+    transform: [{ rotate: '90deg' }],
+  },
+  tournamentCard: {
+    backgroundColor: '#1e293b',
+    borderRadius: 16,
+    padding: 16,
+    marginBottom: 12,
+    borderWidth: 1,
+    borderColor: '#334155',
+  },
+  tournamentHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'flex-start',
+    marginBottom: 12,
+  },
+  tournamentTitleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flex: 1,
+    gap: 8,
+  },
+  tournamentIcon: {
+    fontSize: 24,
+  },
+  tournamentLogoContainer: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    overflow: 'hidden',
+    backgroundColor: '#fff',
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 4,
+  },
+  tournamentLogo: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: '#fff',
+  },
+  tournamentName: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#fff',
+    flex: 1,
+  },
+  badgeContainer: {
+    gap: 8,
+    flexDirection: 'row',
+    alignItems: 'center',
+    flexWrap: 'wrap',
+    justifyContent: 'flex-end',
+  },
+  activeBadge: {
+    backgroundColor: '#ef4444',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 6,
+  },
+  activeBadgeText: {
+    color: '#fff',
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  draftButtonContainer: {
+    alignItems: 'flex-end',
+    marginTop: 8,
+    marginBottom: 8,
+  },
+  draftButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#10b981',
+    paddingHorizontal: 6,
+    paddingVertical: 3,
+    borderRadius: 4,
+    gap: 2,
+  },
+  draftButtonText: {
+    color: '#fff',
+    fontSize: 9,
+    fontWeight: '700',
+  },
+  draftButtonArrow: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  countdownBadge: {
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 6,
+    alignItems: 'center',
+    minWidth: 50,
+  },
+  countdownText: {
+    color: '#fff',
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  tournamentDetails: {
+    gap: 4,
+  },
+  tournamentDetailRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 4,
+  },
+  tournamentDetailRowWithButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 4,
+    gap: 8,
+  },
+  tournamentDetailIcon: {
+    fontSize: 14,
+  },
+  tournamentDetailText: {
+    fontSize: 14,
+    color: '#94a3b8',
+  },
+  usernamePromptBanner: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    zIndex: 1000,
+    paddingHorizontal: 20,
+    paddingVertical: 16,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 8,
+    elevation: 8,
+  },
+  usernamePromptContent: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+  },
+  usernamePromptIcon: {
+    fontSize: 24,
+  },
+  usernamePromptTextContainer: {
+    flex: 1,
+  },
+  usernamePromptTitle: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: '700',
+    marginBottom: 2,
+  },
+  usernamePromptSubtitle: {
+    color: '#fff',
+    fontSize: 13,
+    opacity: 0.9,
+  },
+  usernamePromptButton: {
+    backgroundColor: 'rgba(255, 255, 255, 0.2)',
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    borderRadius: 8,
+  },
+  usernamePromptButtonText: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  skeletonBox: {
+    borderRadius: 6,
+    opacity: 0.5,
+  },
+  emptyCommentsContainer: {
+    padding: 32,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  emptyCommentsText: {
+    fontSize: 14,
+    textAlign: 'center',
+  },
+  hybridModalContainer: {
+    flex: 1,
+    flexDirection: 'column',
+  },
+  transparentOverlay: {
+    flex: 0.2,
+    backgroundColor: 'rgba(0, 0, 0, 0.5)',
+  },
+  modalContentSolid: {
+    flex: 0.8,
+    borderTopLeftRadius: 20,
+    borderTopRightRadius: 20,
   },
 });

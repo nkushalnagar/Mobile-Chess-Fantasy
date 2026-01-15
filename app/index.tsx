@@ -8,14 +8,10 @@ export default function HomeScreen() {
   const { user, profile, loading } = useAuth();
 
   useEffect(() => {
-    console.log('HomeScreen mounted - loading:', loading, 'user:', user, 'profile:', profile);
     if (!loading && user && profile) {
-      console.log('Redirecting to tabs');
       router.replace('/(tabs)/home');
     }
   }, [loading, user, profile]);
-
-  console.log('Rendering HomeScreen - loading:', loading);
 
   // Show loading state while loading OR if user is authenticated (during redirect)
   if (loading || (user && profile)) {
@@ -37,9 +33,9 @@ export default function HomeScreen() {
             style={styles.logo}
             resizeMode="contain"
           />
-          <Text style={styles.titleText}>Fantasy Chess</Text>
+          <Text style={styles.titleText} numberOfLines={1} adjustsFontSizeToFit>Fantasy Chess</Text>
           <Text style={styles.subtitle}>
-            Create your fantasy leagues for chess tournaments
+            Create fantasy leagues for chess tournaments
           </Text>
         </View>
 
@@ -83,14 +79,16 @@ const styles = StyleSheet.create({
   },
   titleText: {
     fontSize: 42,
-    fontWeight: 'bold',
+    fontWeight: '700',
     color: '#fff',
     marginBottom: 16,
+    fontFamily: 'Montserrat-Bold',
   },
   subtitle: {
     fontSize: 16,
     color: '#93c5fd',
     textAlign: 'center',
+    fontFamily: 'Montserrat-Bold',
   },
   buttonContainer: {
     gap: 16,
@@ -106,6 +104,7 @@ const styles = StyleSheet.create({
     color: '#fff',
     fontSize: 18,
     fontWeight: '600',
+    fontFamily: 'Montserrat-Bold',
   },
   secondaryButton: {
     backgroundColor: 'transparent',
@@ -120,5 +119,6 @@ const styles = StyleSheet.create({
     color: '#2563eb',
     fontSize: 18,
     fontWeight: '600',
+    fontFamily: 'Montserrat-Bold',
   },
 });

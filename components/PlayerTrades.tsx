@@ -8,15 +8,23 @@ import {
   Alert,
   Modal,
   ScrollView,
+  Linking,
 } from 'react-native';
 import { supabase } from '@/lib/supabase';
+import { useTheme } from '@/contexts/ThemeContext';
+import { getRatingForTimeControl } from '@/utils/ratingHelper';
+import { checkPlayersInOngoingGames } from '@/utils/checkPlayerInOngoingGame';
 
 interface Player {
   fide_id: string;
   name: string;
   rating: number;
+  rapid_rating?: number;
+  blitz_rating?: number;
   country?: string;
   title?: string;
+  tournament_id?: string | null;
+  season_id?: string | null;
 }
 
 interface Team {
@@ -42,6 +50,8 @@ interface PlayerTradesProps {
   currentRoster: Player[];
   allTeams: Team[];
   onTradeComplete: () => void;
+  league?: { league_type?: string; current_tournament_id?: string | null };
+  timeControl?: string;
 }
 
 export default function PlayerTrades({
@@ -51,7 +61,10 @@ export default function PlayerTrades({
   currentRoster,
   allTeams,
   onTradeComplete,
+  league,
+  timeControl,
 }: PlayerTradesProps) {
+  const { colors } = useTheme();
   const [pendingTrades, setPendingTrades] = useState<Trade[]>([]);
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [selectedTargetTeam, setSelectedTargetTeam] = useState<Team | null>(null);
@@ -59,10 +72,30 @@ export default function PlayerTrades({
   const [mySelectedPlayers, setMySelectedPlayers] = useState<Set<string>>(new Set());
   const [theirSelectedPlayers, setTheirSelectedPlayers] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(false);
+  const [selectedTournamentId, setSelectedTournamentId] = useState<string | null>(null);
+  const [filteredCurrentRoster, setFilteredCurrentRoster] = useState<Player[]>(currentRoster);
+  const [filteredTargetRoster, setFilteredTargetRoster] = useState<Player[]>([]);
+  const [playersInOngoingGames, setPlayersInOngoingGames] = useState<Map<string, { status: 'ongoing' | 'processing', lichessUrl: string }>>(new Map());
 
   useEffect(() => {
     loadPendingTrades();
   }, []);
+
+  // Update filtered rosters when currentRoster changes
+  useEffect(() => {
+    if (selectedTournamentId) {
+      setFilteredCurrentRoster(currentRoster.filter(p => p.tournament_id === selectedTournamentId));
+    } else {
+      setFilteredCurrentRoster(currentRoster);
+    }
+  }, [currentRoster, selectedTournamentId]);
+
+  // Check for players in ongoing games when rosters or tournament changes
+  useEffect(() => {
+    if (filteredCurrentRoster.length > 0 || filteredTargetRoster.length > 0) {
+      loadOngoingGameStatus();
+    }
+  }, [filteredCurrentRoster, filteredTargetRoster, selectedTournamentId]);
 
   const loadPendingTrades = async () => {
     try {
@@ -78,21 +111,65 @@ export default function PlayerTrades({
     }
   };
 
+  const loadOngoingGameStatus = async () => {
+    try {
+      const allFideIds = [
+        ...filteredCurrentRoster.map(p => p.fide_id),
+        ...filteredTargetRoster.map(p => p.fide_id)
+      ];
+      
+      if (allFideIds.length === 0) return;
+      
+      console.log('🎮 Checking ongoing games for players:', allFideIds.length, 'players');
+      console.log('🎮 Current roster FIDs:', filteredCurrentRoster.map(p => p.fide_id));
+      console.log('🎮 Target roster FIDs:', filteredTargetRoster.map(p => p.fide_id));
+      const ongoingMap = await checkPlayersInOngoingGames(
+        allFideIds,
+        selectedTournamentId || undefined,
+        leagueId
+      );
+      console.log('🎮 Found ongoing games:', ongoingMap.size);
+      console.log('🎮 Players in ongoing games:', Array.from(ongoingMap.keys()));
+      setPlayersInOngoingGames(ongoingMap);
+    } catch (error) {
+      console.error('Error checking ongoing games:', error);
+    }
+  };
+
   const loadTargetTeamRoster = async (team: Team) => {
     try {
-      const { data, error } = await supabase
+      // For tournament leagues, show all players from all drafted tournaments
+      let query = supabase
         .from('team_players')
         .select(`
           player_fide_id,
-          players(fide_id, name, rating, country, title)
+          tournament_id,
+          season_id,
+          players(fide_id, name, rating, rapid_rating, blitz_rating, country, title)
         `)
         .eq('team_id', team.id)
         .eq('league_id', leagueId);
 
+      // No filtering by current_tournament_id - show all drafted players
+
+      const { data, error } = await query;
+
       if (error) throw error;
 
-      const players = data?.map((tp: any) => tp.players).filter(Boolean) || [];
+      const players = data?.map((tp: any) => ({
+        ...tp.players,
+        tournament_id: tp.tournament_id,
+        season_id: tp.season_id
+      })).filter(Boolean) || [];
       setTargetTeamRoster(players);
+      
+      // Filter by selected tournament if one is selected
+      if (selectedTournamentId) {
+        const filtered = players.filter(p => p.tournament_id === selectedTournamentId);
+        setFilteredTargetRoster(filtered);
+      } else {
+        setFilteredTargetRoster(players);
+      }
     } catch (error) {
       console.error('Error loading target team roster:', error);
     }
@@ -102,24 +179,60 @@ export default function PlayerTrades({
     setSelectedTargetTeam(team);
     setMySelectedPlayers(new Set());
     setTheirSelectedPlayers(new Set());
+    setSelectedTournamentId(null);
+    setFilteredCurrentRoster(currentRoster);
     await loadTargetTeamRoster(team);
   };
 
   const toggleMyPlayer = (fideId: string) => {
+    const player = currentRoster.find(p => p.fide_id === fideId);
     const newSet = new Set(mySelectedPlayers);
+    
     if (newSet.has(fideId)) {
       newSet.delete(fideId);
+      // If no players selected, clear tournament filter
+      if (newSet.size === 0) {
+        console.log('🔄 Cleared my player selection, showing all players');
+        setSelectedTournamentId(null);
+        setFilteredCurrentRoster(currentRoster);
+        setFilteredTargetRoster(targetTeamRoster);
+      }
     } else {
+      // First selection sets the tournament filter
+      if (newSet.size === 0 && player?.tournament_id) {
+        console.log('📍 Selected my player from tournament:', player.tournament_id);
+        setSelectedTournamentId(player.tournament_id);
+        // Filter both rosters by this tournament
+        setFilteredCurrentRoster(currentRoster.filter(p => p.tournament_id === player.tournament_id));
+        setFilteredTargetRoster(targetTeamRoster.filter(p => p.tournament_id === player.tournament_id));
+      }
       newSet.add(fideId);
     }
     setMySelectedPlayers(newSet);
   };
 
   const toggleTheirPlayer = (fideId: string) => {
+    const player = targetTeamRoster.find(p => p.fide_id === fideId);
     const newSet = new Set(theirSelectedPlayers);
+    
     if (newSet.has(fideId)) {
       newSet.delete(fideId);
+      // If no players selected, clear tournament filter
+      if (newSet.size === 0) {
+        console.log('🔄 Cleared their player selection, showing all players');
+        setSelectedTournamentId(null);
+        setFilteredCurrentRoster(currentRoster);
+        setFilteredTargetRoster(targetTeamRoster);
+      }
     } else {
+      // First selection sets the tournament filter
+      if (newSet.size === 0 && player?.tournament_id) {
+        console.log('📍 Selected their player from tournament:', player.tournament_id);
+        setSelectedTournamentId(player.tournament_id);
+        // Filter both rosters by this tournament
+        setFilteredCurrentRoster(currentRoster.filter(p => p.tournament_id === player.tournament_id));
+        setFilteredTargetRoster(targetTeamRoster.filter(p => p.tournament_id === player.tournament_id));
+      }
       newSet.add(fideId);
     }
     setTheirSelectedPlayers(newSet);
@@ -240,30 +353,30 @@ export default function PlayerTrades({
   };
 
   const renderTradeItem = ({ item }: { item: Trade }) => (
-    <View style={styles.tradeCard}>
+    <View style={[styles.tradeCard, { backgroundColor: colors.cardBackground, borderColor: colors.border }]}>
       <View style={styles.tradeHeader}>
-        <Text style={styles.tradeDirection}>
+        <Text style={[styles.tradeDirection, { color: colors.primary }]}>
           {item.direction === 'incoming' ? '📥 Incoming' : '📤 Outgoing'}
         </Text>
-        <Text style={styles.tradeUsername}>{item.other_username}</Text>
+        <Text style={[styles.tradeUsername, { color: colors.textSecondary }]}>{item.other_username}</Text>
       </View>
 
       <View style={styles.tradeDetails}>
         <View style={styles.tradeColumn}>
-          <Text style={styles.tradeColumnTitle}>You Give:</Text>
+          <Text style={[styles.tradeColumnTitle, { color: colors.textSecondary }]}>You Give:</Text>
           {(item.direction === 'outgoing' ? item.from_players : item.to_players).map((player) => (
-            <Text key={player.fide_id} style={styles.playerText}>
+            <Text key={player.fide_id} style={[styles.playerText, { color: colors.text }]}>
               {player.title && `${player.title} `}{player.name}
             </Text>
           ))}
         </View>
 
-        <Text style={styles.tradeArrow}>↔</Text>
+        <Text style={[styles.tradeArrow, { color: colors.textSecondary }]}>↔</Text>
 
         <View style={styles.tradeColumn}>
-          <Text style={styles.tradeColumnTitle}>You Get:</Text>
+          <Text style={[styles.tradeColumnTitle, { color: colors.textSecondary }]}>You Get:</Text>
           {(item.direction === 'outgoing' ? item.to_players : item.from_players).map((player) => (
-            <Text key={player.fide_id} style={styles.playerText}>
+            <Text key={player.fide_id} style={[styles.playerText, { color: colors.text }]}>
               {player.title && `${player.title} `}{player.name}
             </Text>
           ))}
@@ -303,7 +416,18 @@ export default function PlayerTrades({
   return (
     <View style={styles.container}>
       <View style={styles.header}>
-        <Text style={styles.sectionTitle}>🔄 Player Trades</Text>
+        <View style={styles.titleRow}>
+          <Text style={[styles.sectionTitle, { color: colors.text }]}>🔄 Player Trades</Text>
+          <TouchableOpacity
+            style={[styles.infoButton, { backgroundColor: colors.cardBackground, borderColor: colors.border }]}
+            onPress={() => Alert.alert(
+              'Trading Rules',
+              '• Can only trade players from the same tournament\n• Cannot trade players during their games\n• Select players from both teams, then send the trade request\n• Both teams must have the same number of players in the trade'
+            )}
+          >
+            <Text style={[styles.infoButtonText, { color: colors.primary }]}>ⓘ</Text>
+          </TouchableOpacity>
+        </View>
         <TouchableOpacity
           style={styles.createButton}
           onPress={() => setShowCreateModal(true)}
@@ -313,7 +437,7 @@ export default function PlayerTrades({
       </View>
 
       {pendingTrades.length === 0 ? (
-        <Text style={styles.emptyText}>No pending trades</Text>
+        <Text style={[styles.emptyText, { color: colors.textSecondary }]}>No pending trades</Text>
       ) : (
         <FlatList
           data={pendingTrades}
@@ -330,11 +454,11 @@ export default function PlayerTrades({
         transparent={false}
         onRequestClose={() => setShowCreateModal(false)}
       >
-        <View style={styles.modalContainer}>
-          <View style={styles.modalHeader}>
-            <Text style={styles.modalTitle}>Propose Trade</Text>
+        <View style={[styles.modalContainer, { backgroundColor: colors.background }]}>
+          <View style={[styles.modalHeader, { borderBottomColor: colors.border }]}>
+            <Text style={[styles.modalTitle, { color: colors.text }]}>Propose Trade</Text>
             <TouchableOpacity onPress={() => setShowCreateModal(false)}>
-              <Text style={styles.closeButton}>✕</Text>
+              <Text style={[styles.closeButton, { color: colors.textSecondary }]}>✕</Text>
             </TouchableOpacity>
           </View>
 
@@ -342,60 +466,114 @@ export default function PlayerTrades({
             {/* Select Target Team */}
             {!selectedTargetTeam ? (
               <View>
-                <Text style={styles.stepTitle}>Select Team to Trade With:</Text>
+                <Text style={[styles.stepTitle, { color: colors.text }]}>Select Team to Trade With:</Text>
                 {otherTeams.map((team) => (
                   <TouchableOpacity
                     key={team.id}
-                    style={styles.teamOption}
+                    style={[styles.teamOption, { backgroundColor: colors.cardBackground, borderColor: colors.border }]}
                     onPress={() => handleSelectTargetTeam(team)}
                   >
-                    <Text style={styles.teamOptionText}>{team.username}</Text>
+                    <Text style={[styles.teamOptionText, { color: colors.text }]}>{team.username}</Text>
                   </TouchableOpacity>
                 ))}
               </View>
             ) : (
               <View>
-                <Text style={styles.stepTitle}>Trading with: {selectedTargetTeam.username}</Text>
+                <Text style={[styles.stepTitle, { color: colors.text }]}>Trading with: {selectedTargetTeam.username}</Text>
 
                 {/* Your Players */}
-                <Text style={styles.subsectionTitle}>Your Players (select to offer):</Text>
-                {currentRoster.map((player) => (
-                  <TouchableOpacity
-                    key={player.fide_id}
-                    style={[
-                      styles.playerOption,
-                      mySelectedPlayers.has(player.fide_id) && styles.playerOptionSelected,
-                    ]}
-                    onPress={() => toggleMyPlayer(player.fide_id)}
-                  >
-                    <Text style={styles.playerOptionText}>
-                      {player.title && `${player.title} `}{player.name} ({player.rating})
-                    </Text>
-                    {mySelectedPlayers.has(player.fide_id) && (
-                      <Text style={styles.checkmark}>✓</Text>
-                    )}
-                  </TouchableOpacity>
-                ))}
+                <Text style={[styles.subsectionTitle, { color: colors.text }]}>Your Players (select to offer):</Text>
+                {filteredCurrentRoster.map((player) => {
+                  const playerStatus = playersInOngoingGames.get(player.fide_id);
+                  const isInOngoingGame = !!playerStatus;
+                  const lichessUrl = playerStatus?.lichessUrl;
+                  return (
+                    <TouchableOpacity
+                      key={player.fide_id}
+                      disabled={isInOngoingGame}
+                      style={[
+                        styles.playerOption,
+                        { backgroundColor: colors.cardBackground, borderColor: colors.border },
+                        mySelectedPlayers.has(player.fide_id) && styles.playerOptionSelected,
+                        isInOngoingGame && { opacity: 0.5 },
+                      ]}
+                      onPress={() => toggleMyPlayer(player.fide_id)}
+                    >
+                      {isInOngoingGame && (
+                        <TouchableOpacity 
+                          style={styles.inGameBadge}
+                          onPress={(e) => {
+                            e.stopPropagation();
+                            if (lichessUrl) Linking.openURL(lichessUrl);
+                          }}
+                          disabled={!lichessUrl}
+                        >
+                          <Text style={[
+                            styles.inGameBadgeText,
+                            playerStatus?.status === 'processing' && { fontSize: 5.5, letterSpacing: 0.2 }
+                          ]}>
+                {playerStatus?.status === 'ongoing' ? 'IN GAME' : 'PROCESSING'}
+              </Text>
+                        </TouchableOpacity>
+                      )}
+                      <Text style={[styles.playerOptionText, { color: colors.text }, isInOngoingGame && { paddingLeft: 30 }]}>
+                        {player.title && `${player.title} `}{player.name} ({getRatingForTimeControl(player, timeControl)})
+                      </Text>
+                      {mySelectedPlayers.has(player.fide_id) && (
+                        <Text style={styles.checkmark}>✓</Text>
+                      )}
+                    </TouchableOpacity>
+                  );
+                })}
 
                 {/* Their Players */}
-                <Text style={styles.subsectionTitle}>Their Players (select to request):</Text>
-                {targetTeamRoster.map((player) => (
-                  <TouchableOpacity
-                    key={player.fide_id}
-                    style={[
-                      styles.playerOption,
-                      theirSelectedPlayers.has(player.fide_id) && styles.playerOptionSelected,
-                    ]}
-                    onPress={() => toggleTheirPlayer(player.fide_id)}
-                  >
-                    <Text style={styles.playerOptionText}>
-                      {player.title && `${player.title} `}{player.name} ({player.rating})
-                    </Text>
-                    {theirSelectedPlayers.has(player.fide_id) && (
-                      <Text style={styles.checkmark}>✓</Text>
-                    )}
-                  </TouchableOpacity>
-                ))}
+                <Text style={[styles.subsectionTitle, { color: colors.text }]}>Their Players (select to request):</Text>
+                {filteredTargetRoster.map((player) => {
+                  const playerStatus = playersInOngoingGames.get(player.fide_id);
+                  const isInOngoingGame = !!playerStatus;
+                  const lichessUrl = playerStatus?.lichessUrl;
+                  const isDisabled = isInOngoingGame || mySelectedPlayers.size === 0;
+                  if (isInOngoingGame) {
+                    console.log('🎮 Their player in game:', player.name, player.fide_id);
+                  }
+                  return (
+                    <TouchableOpacity
+                      key={player.fide_id}
+                      disabled={isDisabled}
+                      style={[
+                        styles.playerOption,
+                        { backgroundColor: colors.cardBackground, borderColor: colors.border },
+                        theirSelectedPlayers.has(player.fide_id) && styles.playerOptionSelected,
+                        isDisabled && { opacity: 0.5 },
+                      ]}
+                      onPress={() => toggleTheirPlayer(player.fide_id)}
+                    >
+                      {isInOngoingGame && (
+                        <TouchableOpacity 
+                          style={styles.inGameBadge}
+                          onPress={(e) => {
+                            e.stopPropagation();
+                            if (lichessUrl) Linking.openURL(lichessUrl);
+                          }}
+                          disabled={!lichessUrl}
+                        >
+                          <Text style={[
+                            styles.inGameBadgeText,
+                            playerStatus?.status === 'processing' && { fontSize: 5.5, letterSpacing: 0.2 }
+                          ]}>
+                {playerStatus?.status === 'ongoing' ? 'IN GAME' : 'PROCESSING'}
+              </Text>
+                        </TouchableOpacity>
+                      )}
+                      <Text style={[styles.playerOptionText, { color: colors.text }, isInOngoingGame && { paddingLeft: 30 }]}>
+                        {player.title && `${player.title} `}{player.name} ({getRatingForTimeControl(player, timeControl)})
+                      </Text>
+                      {theirSelectedPlayers.has(player.fide_id) && (
+                        <Text style={styles.checkmark}>✓</Text>
+                      )}
+                    </TouchableOpacity>
+                  );
+                })}
 
                 {/* Submit Button */}
                 <TouchableOpacity
@@ -430,20 +608,39 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     marginBottom: 16,
   },
+  titleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    flex: 1,
+  },
   sectionTitle: {
     fontSize: 20,
     fontWeight: 'bold',
     color: '#fff',
   },
+  infoButton: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    borderWidth: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  infoButtonText: {
+    fontSize: 16,
+    fontWeight: 'bold',
+  },
   createButton: {
     backgroundColor: '#3b82f6',
-    paddingHorizontal: 16,
+    paddingHorizontal: 12,
     paddingVertical: 8,
     borderRadius: 8,
+    flexShrink: 1,
   },
   createButtonText: {
     color: '#fff',
-    fontSize: 14,
+    fontSize: 13,
     fontWeight: '600',
   },
   emptyText: {
@@ -596,6 +793,27 @@ const styles = StyleSheet.create({
   checkmark: {
     fontSize: 18,
     color: '#3b82f6',
+  },
+  inGameBadge: {
+    position: 'absolute',
+    left: 0,
+    top: 0,
+    bottom: 0,
+    width: 28,
+    backgroundColor: '#DC2626',
+    justifyContent: 'center',
+    alignItems: 'center',
+    borderTopLeftRadius: 8,
+    borderBottomLeftRadius: 8,
+  },
+  inGameBadgeText: {
+    color: '#fff',
+    fontSize: 7,
+    fontWeight: '700',
+    letterSpacing: 0.3,
+    transform: [{ rotate: '-90deg' }],
+    width: 60,
+    textAlign: 'center',
   },
   submitButton: {
     backgroundColor: '#3b82f6',

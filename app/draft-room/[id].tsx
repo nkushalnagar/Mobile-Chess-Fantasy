@@ -13,11 +13,28 @@ import {
 import { useLocalSearchParams, useRouter, Stack } from 'expo-router';
 import { supabase } from '@/lib/supabase';
 import { useAuth } from '@/contexts/AuthContext';
+import { useTheme } from '@/contexts/ThemeContext';
+import PlayerProfileModal from '@/components/PlayerProfileModal';
+import { getRatingForTimeControl } from '@/utils/ratingHelper';
+
+const getTitleColor = (title: string | undefined): string => {
+  if (!title) return '#94a3b8';
+  if (title === 'GM') return '#fbbf24';
+  if (title === 'IM') return '#a78bfa';
+  if (title === 'FM') return '#60a5fa';
+  if (title === 'WGM') return '#fbbf24';
+  if (title === 'WIM') return '#a78bfa';
+  if (title === 'WFM') return '#60a5fa';
+  if (title === 'CM' || title === 'NM' || title === 'WCM' || title === 'WNM') return '#34d399';
+  return '#94a3b8';
+};
 
 interface Player {
   fide_id: string;
   name: string;
   rating: number;
+  rapid_rating?: number;
+  blitz_rating?: number;
   country: string;
   title?: string;
 }
@@ -30,6 +47,7 @@ interface DraftState {
   current_team_id: string | null;
   pick_deadline: string | null;
   is_active: boolean;
+  tournament_id?: string | null;
 }
 
 interface DraftPick {
@@ -55,6 +73,7 @@ export default function DraftRoomScreen() {
   const { id: leagueId } = useLocalSearchParams();
   const router = useRouter();
   const { user } = useAuth();
+  const { colors } = useTheme();
 
   const [players, setPlayers] = useState<Player[]>([]);
   const [draftState, setDraftState] = useState<DraftState | null>(null);
@@ -63,7 +82,9 @@ export default function DraftRoomScreen() {
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedPlayer, setSelectedPlayer] = useState<Player | null>(null);
-  const [timeRemaining, setTimeRemaining] = useState<number>(30);
+  const [timeRemaining, setTimeRemaining] = useState<number>(60);
+  const [profileModalVisible, setProfileModalVisible] = useState(false);
+  const [selectedProfilePlayer, setSelectedProfilePlayer] = useState<Player | null>(null);
   const [pickingInProgress, setPickingInProgress] = useState(false);
   const [teamId, setTeamId] = useState<string | null>(null);
   const [isOwner, setIsOwner] = useState(false);
@@ -84,7 +105,17 @@ export default function DraftRoomScreen() {
     intervalId: null,
   });
 
+  // Ref to track current tournament_id for realtime subscriptions
+  const tournamentIdRef = useRef<string | null>(null);
+
   const searchStateRef = useRef({ page: 0, query: '' });
+
+  // Update tournamentIdRef whenever draftState changes
+  useEffect(() => {
+    if (draftState?.tournament_id) {
+      tournamentIdRef.current = draftState.tournament_id;
+    }
+  }, [draftState?.tournament_id]);
 
   // Load initial data
   useEffect(() => {
@@ -97,9 +128,6 @@ export default function DraftRoomScreen() {
 
     console.log('📡 Setting up real-time subscriptions');
 
-    let pollInterval: NodeJS.Timeout | null = null;
-    let isActive = true;
-
     const draftStateChannel = supabase
       .channel(`draft_state:${leagueId}`)
       .on(
@@ -110,23 +138,18 @@ export default function DraftRoomScreen() {
           table: 'draft_state',
           filter: `league_id=eq.${leagueId}`,
         },
-        (payload) => {
+        (payload: any) => {
           console.log('🔄 Draft state update:', payload.eventType);
+          const newState = payload.new as any;
           console.log('New state:', {
-            active: payload.new?.is_active,
-            pick: payload.new?.current_pick_number,
-            round: payload.new?.current_round,
-            team: payload.new?.current_team_id,
+            active: newState?.is_active,
+            pick: newState?.current_pick_number,
+            round: newState?.current_round,
+            team: newState?.current_team_id,
           });
           
-          // Stop polling if draft becomes inactive
-          if (payload.new?.is_active === false) {
-            console.log('🛑 Draft completed, stopping polling');
-            isActive = false;
-            if (pollInterval) {
-              clearInterval(pollInterval);
-              pollInterval = null;
-            }
+          if (newState?.is_active === false) {
+            console.log('🛑 Draft completed');
           }
           
           loadDraftState();
@@ -146,28 +169,23 @@ export default function DraftRoomScreen() {
           table: 'team_players',
           filter: `league_id=eq.${leagueId}`,
         },
-        () => {
-          console.log('✅ New pick detected');
+        (payload) => {
+          console.log('✅ New pick detected via realtime:', payload);
           loadDraftPicks();
+          // Refresh available players to remove the drafted player immediately
+          // Always reset to page 0 when refreshing after a pick
+          loadPlayers(0, searchStateRef.current.query, false, tournamentIdRef.current);
         }
       )
       .subscribe((status) => {
         console.log('Draft picks channel status:', status);
+        if (status === 'SUBSCRIPTION_ERROR') {
+          console.error('❌ Failed to subscribe to draft picks channel');
+        }
       });
-
-    // Poll for updates as backup (every 3 seconds)
-    pollInterval = setInterval(() => {
-      if (isActive) {
-        loadDraftState();
-        loadDraftPicks();
-        // Refresh available players with current page/search state
-        loadPlayers(searchStateRef.current.page, searchStateRef.current.query, false);
-      }
-    }, 3000);
 
     return () => {
       console.log('🧹 Cleaning up subscriptions');
-      if (pollInterval) clearInterval(pollInterval);
       supabase.removeChannel(draftStateChannel);
       supabase.removeChannel(draftPicksChannel);
     };
@@ -248,11 +266,29 @@ export default function DraftRoomScreen() {
 
       setTeamId(membership?.team_id || null);
 
-      // Load all data in parallel
+      // Load draft state first (needed for tournament_id)
+      const draftStateData = await loadDraftState();
+      
+      // Get tournament_id from draft state
+      const tournamentId = draftStateData?.tournament_id;
+      
+      console.log('🔍 Tournament ID for draft:', {
+        fromDraftState: draftStateData?.tournament_id,
+        using: tournamentId
+      });
+      
+      // Update the ref with the tournament_id
+      if (tournamentId) {
+        tournamentIdRef.current = tournamentId;
+      } else if (leagueData?.league_type === 'tournament') {
+        // For tournament leagues, tournament_id is required
+        throw new Error('Draft state is missing tournament_id for tournament league');
+      }
+      
+      // Then load other data in parallel, passing tournament_id directly
       await Promise.all([
-        loadPlayers(0, ''),
+        loadPlayers(0, '', false, tournamentId),
         loadDraftOrder(),
-        loadDraftState(),
         loadDraftPicks(),
       ]);
     } catch (error) {
@@ -263,15 +299,28 @@ export default function DraftRoomScreen() {
     }
   };
 
-  const loadPlayers = async (page = 0, search = '', append = false) => {
+  const loadPlayers = async (page = 0, search = '', append = false, tournamentId?: string | null) => {
     // Only show loading on initial load or when appending
     if (append) setLoadingMore(true);
     
     try {
+      // Use tournament_id from parameter, or fall back to ref (which always has current value)
+      const tournamentIdToUse = tournamentId !== undefined ? tournamentId : tournamentIdRef.current;
+      
+      console.log('🔍 loadPlayers called:', {
+        page,
+        search,
+        append,
+        tournamentIdParam: tournamentId,
+        tournamentIdRef: tournamentIdRef.current,
+        using: tournamentIdToUse
+      });
+      
       // Use the paginated function with search
       const { data, error } = await supabase
         .rpc('get_draftable_players_paginated', { 
           p_league_id: leagueId,
+          p_tournament_id: tournamentIdToUse || null,
           p_search_query: search,
           p_limit: 100,
           p_offset: page * 100
@@ -279,13 +328,28 @@ export default function DraftRoomScreen() {
 
       if (error) throw error;
       
+      console.log('📊 loadPlayers result:', {
+        dataLength: data?.length,
+        totalCount: data?.[0]?.total_count,
+        append
+      });
+      
       if (data && data.length > 0) {
         setTotalPlayers(data[0].total_count || 0);
         
         if (append) {
-          setPlayers(prev => [...prev, ...data]);
+          // Deduplicate when appending to prevent duplicate keys
+          setPlayers(prev => {
+            const existingIds = new Set(prev.map(p => p.fide_id));
+            const newPlayers = data.filter(p => !existingIds.has(p.fide_id));
+            return [...prev, ...newPlayers];
+          });
         } else {
-          setPlayers(data);
+          // Deduplicate on initial load as well
+          const uniquePlayers = data.filter((player, index, self) => 
+            index === self.findIndex(p => p.fide_id === player.fide_id)
+          );
+          setPlayers(uniquePlayers);
         }
       } else {
         if (!append) setPlayers([]);
@@ -316,32 +380,50 @@ export default function DraftRoomScreen() {
       .from('draft_state')
       .select('*')
       .eq('league_id', leagueId)
-      .eq('is_active', true)
-      .single();
+      .order('created_at', { ascending: false })
+      .limit(1);
 
-    if (error && error.code !== 'PGRST116') {
+    if (error) {
       console.error('Error loading draft state:', error);
       throw error;
     }
     
+    // Get the first (most recent) draft state
+    const draftStateData = data?.[0] || null;
+    
     console.log('✅ Draft state loaded:', {
-      pick: data?.current_pick_number,
-      round: data?.current_round,
-      team: data?.current_team_id,
-      active: data?.is_active,
+      pick: draftStateData?.current_pick_number,
+      round: draftStateData?.current_round,
+      team: draftStateData?.current_team_id,
+      active: draftStateData?.is_active,
+      tournament_id: draftStateData?.tournament_id,
     });
     
-    setDraftState(data);
+    setDraftState(draftStateData);
+    return draftStateData;
   };
 
   const loadDraftPicks = async () => {
-    const { data, error } = await supabase
+    // Build query to filter by tournament_id if this is a tournament league
+    let query = supabase
       .from('team_players')
-      .select('*, player:players(name, rating, country, title)')
-      .eq('league_id', leagueId)
-      .order('created_at', { ascending: true });
+      .select('*, player:players(name, rating, rapid_rating, blitz_rating, country, title)')
+      .eq('league_id', leagueId);
+    
+    // Filter by tournament_id if available (for tournament leagues)
+    if (tournamentIdRef.current) {
+      query = query.eq('tournament_id', tournamentIdRef.current);
+    }
+    
+    const { data, error } = await query.order('created_at', { ascending: true });
 
     if (error) throw error;
+    
+    console.log('📊 Loaded draft picks:', {
+      total: data?.length,
+      tournament_id: tournamentIdRef.current
+    });
+    
     // Map to old format for compatibility
     const picks = data?.map((tp: any, index: number) => ({
       id: tp.id,
@@ -365,25 +447,100 @@ export default function DraftRoomScreen() {
 
     setPickingInProgress(true);
 
+    // Optimistic UI update - add pick immediately
+    const optimisticPickNumber = draftPicks.length + 1;
+    const optimisticPick = {
+      id: `temp-${Date.now()}`,
+      league_id: leagueId as string,
+      team_id: teamId,
+      player_fide_id: selectedPlayer.fide_id,
+      pick_number: optimisticPickNumber,
+      round: Math.floor((optimisticPickNumber - 1) / (league?.max_members || 1)) + 1,
+      player: {
+        fide_id: selectedPlayer.fide_id,
+        name: selectedPlayer.name,
+        rating: selectedPlayer.rating,
+        rapid_rating: selectedPlayer.rapid_rating,
+        blitz_rating: selectedPlayer.blitz_rating,
+        country: selectedPlayer.country,
+        title: selectedPlayer.title,
+      }
+    };
+
+    // Update UI immediately
+    setDraftPicks([...draftPicks, optimisticPick]);
+    setSelectedPlayer(null);
+
+    // Remove picked player from available players list
+    setPlayers(players.filter(p => p.fide_id !== selectedPlayer.fide_id));
+
+    // Optimistically update draft state to show next pick
+    const totalPicks = league.picks_per_person * league.max_members;
+    const nextPickNumber = draftState.current_pick_number + 1;
+    const nextRound = Math.ceil(nextPickNumber / draftOrder.length);
+    const positionInRound = ((nextPickNumber - 1) % draftOrder.length);
+    const isReverseRound = nextRound % 2 === 0;
+    const nextTeamIndex = isReverseRound 
+      ? (draftOrder.length - 1 - positionInRound)
+      : positionInRound;
+    const nextTeam = draftOrder[nextTeamIndex];
+
+    if (nextPickNumber <= totalPicks && nextTeam) {
+      setDraftState({
+        ...draftState,
+        current_pick_number: nextPickNumber,
+        current_round: nextRound,
+        current_team_id: nextTeam.team_id,
+      });
+    }
+
     try {
+      // Ensure we have either tournament_id or season_id (required by constraint)
+      const tournamentId = league?.league_type === 'tournament' ? draftState?.tournament_id : null;
+      const seasonId = league?.league_type === 'season' ? league?.season_id : null;
+
+      if (!tournamentId && !seasonId) {
+        throw new Error('League configuration error: missing tournament or season');
+      }
+
       const { error: pickError } = await supabase
         .from('team_players')
         .insert({
           league_id: leagueId as string,
           team_id: teamId,
-          player_fide_id: selectedPlayer.fide_id,
-          tournament_id: league?.league_type === 'tournament' ? (league?.current_tournament_id || null) : null,
-          season_id: league?.league_type === 'season' ? (league?.season_id || null) : null,
+          player_fide_id: optimisticPick.player_fide_id,
+          tournament_id: draftState?.tournament_id || null,
+          season_id: seasonId,
           fantasy_score: 0,
         });
 
       if (pickError) throw pickError;
 
       await advanceDraft();
-      setSelectedPlayer(null);
-    } catch (error) {
+      
+      // Reload to get real data with correct IDs
+      await loadDraftPicks();
+    } catch (error: any) {
       console.error('Error picking player:', error);
-      Alert.alert('Error', 'Failed to pick player');
+      
+      // Check if it's a duplicate key error (player already picked on another device)
+      if (error?.code === '23505') {
+        console.log('⚠️ Player already picked on another device, refreshing...');
+        Alert.alert('Player Already Picked', 'This player was just picked on another device. Please select another player.');
+        
+        // Immediately refresh all data to get the latest state
+        await Promise.all([
+          loadDraftState(),
+          loadDraftPicks(),
+          loadPlayers(searchStateRef.current.page, searchStateRef.current.query, false, draftState?.tournament_id)
+        ]);
+      } else {
+        Alert.alert('Error', 'Failed to pick player');
+      }
+      
+      // Rollback optimistic update on error
+      setDraftPicks(draftPicks);
+      setSelectedPlayer(null);
     } finally {
       setPickingInProgress(false);
     }
@@ -419,23 +576,39 @@ export default function DraftRoomScreen() {
       const autoPick = availablePlayers[0];
       console.log('🎯 Auto-picking:', autoPick.name);
 
-      // Check if already picked
-      const { data: existingPick, error: checkError } = await supabase
-        .from('team_players')
-        .select('id')
-        .eq('league_id', leagueId)
-        .eq('player_fide_id', autoPick.fide_id)
-        .maybeSingle();
+      // Refresh data one more time right before picking to minimize race conditions
+      await Promise.all([
+        loadDraftPicks(),
+        loadPlayers(searchStateRef.current.page, searchStateRef.current.query, false, draftState?.tournament_id)
+      ]);
 
-      if (checkError) {
-        console.error('Error checking existing pick:', checkError);
+      // Re-check available players after refresh
+      const refreshedPickedIds = draftPicks.map((p) => p.player_fide_id);
+      const refreshedAvailable = players.filter(
+        (p) => !refreshedPickedIds.includes(p.fide_id)
+      );
+
+      if (refreshedAvailable.length === 0 || !refreshedAvailable.find(p => p.fide_id === autoPick.fide_id)) {
+        console.log('⚠️ Player no longer available after refresh, aborting auto-pick');
         setPickingInProgress(false);
         return;
       }
 
-      if (existingPick) {
-        console.log('⚠️ Player already picked, reloading...');
-        await loadDraftPicks();
+      // Ensure we have either tournament_id or season_id (required by constraint)
+      const tournamentId = league?.league_type === 'tournament' ? draftState?.tournament_id : null;
+      const seasonId = league?.league_type === 'season' ? league?.season_id : null;
+
+      console.log('🔍 League config:', {
+        league_type: league?.league_type,
+        draft_state_tournament_id: draftState?.tournament_id,
+        season_id: league?.season_id,
+        tournamentId,
+        seasonId
+      });
+
+      if (!tournamentId && !seasonId) {
+        console.error('❌ Missing tournament_id or season_id');
+        Alert.alert('Error', 'League configuration error: missing tournament or season');
         setPickingInProgress(false);
         return;
       }
@@ -446,14 +619,20 @@ export default function DraftRoomScreen() {
           league_id: leagueId as string,
           team_id: draftState.current_team_id!,
           player_fide_id: autoPick.fide_id,
-          tournament_id: league?.league_type === 'tournament' ? (league?.current_tournament_id || null) : null,
-          season_id: league?.league_type === 'season' ? (league?.season_id || null) : null,
+          tournament_id: tournamentId,
+          season_id: seasonId,
           fantasy_score: 0,
         });
 
       if (pickError) {
         if (pickError.code === '23505') {
-          console.log('⚠️ Duplicate pick (race condition)');
+          console.log('⚠️ Duplicate pick (race condition), refreshing data...');
+          // Immediately refresh all data to sync with other devices
+          await Promise.all([
+            loadDraftState(),
+            loadDraftPicks(),
+            loadPlayers(searchStateRef.current.page, searchStateRef.current.query, false, draftState?.tournament_id)
+          ]);
           setPickingInProgress(false);
           return;
         }
@@ -476,6 +655,8 @@ export default function DraftRoomScreen() {
   };
 
   const advanceDraft = async () => {
+    console.log('🚀 advanceDraft called');
+    
     if (!draftState || !league) {
       console.log('⚠️ Cannot advance draft:', { hasDraftState: !!draftState, hasLeague: !!league });
       return;
@@ -490,26 +671,45 @@ export default function DraftRoomScreen() {
       currentPick: draftState.current_pick_number,
       totalPicks,
       nextPick: nextPickNumber,
+      willComplete: nextPickNumber > totalPicks,
     });
 
     if (nextPickNumber > totalPicks) {
-      console.log('🏁 Draft complete!');
-      // Draft complete
-      await supabase
-        .from('draft_state')
-        .update({
-          is_active: false,
-          pick_deadline: null,
-        })
-        .eq('league_id', leagueId);
+      console.log('🏁 Draft complete! All picks made.');
+      console.log('📊 Final stats:', {
+        currentPick: draftState.current_pick_number,
+        totalPicks,
+        nextPick: nextPickNumber,
+        leagueId,
+      });
+      
+      try {
+        // Call RPC function to complete draft (bypasses RLS)
+        console.log('🔄 Calling complete_draft RPC...');
+        const { data, error } = await supabase.rpc('complete_draft', {
+          p_league_id: leagueId
+        });
 
-      await supabase
-        .from('leagues')
-        .update({ status: 'active' })
-        .eq('id', leagueId);
+        if (error) throw error;
+        
+        console.log('✅ Draft completion response:', data);
 
-      // Reload draft state to show complete screen
-      await loadDraftState();
+        // Verify the completion was successful
+        if (data?.league_status !== 'active' || data?.draft_active !== false) {
+          console.warn('⚠️ Draft completion verification failed:', data);
+          throw new Error('Draft completion verification failed');
+        }
+
+        console.log('✅ SUCCESS: Draft completed and verified');
+
+        // Reload draft state to show completion screen
+        await loadDraftState();
+        
+      } catch (error) {
+        console.error('❌ Error completing draft:', error);
+        Alert.alert('Error', 'Failed to complete draft. Please contact support.');
+      }
+      
       return;
     }
 
@@ -550,7 +750,7 @@ export default function DraftRoomScreen() {
         current_pick_number: nextPickNumber,
         current_round: nextRound,
         current_team_id: nextTeamId,
-        pick_deadline: new Date(Date.now() + 30000).toISOString(),
+        pick_deadline: new Date(Date.now() + 60000).toISOString(), // 60 seconds for all picks
       })
       .eq('league_id', leagueId);
 
@@ -572,20 +772,20 @@ export default function DraftRoomScreen() {
           style: 'destructive',
           onPress: async () => {
             try {
-              await supabase
-                .from('draft_state')
-                .update({ is_active: false, pick_deadline: null })
-                .eq('league_id', leagueId);
+              // Use RPC to atomically complete the draft
+              const { error: completeError } = await supabase
+                .rpc('complete_draft', { p_league_id: leagueId });
 
-              await supabase
-                .from('leagues')
-                .update({ status: 'active' })
-                .eq('id', leagueId);
+              if (completeError) {
+                console.error('❌ Error stopping draft:', completeError);
+                throw completeError;
+              }
 
-              router.back();
+              console.log('✅ Draft stopped, league set to active');
+              router.push('/(tabs)/leagues');
             } catch (error) {
               console.error('Error stopping draft:', error);
-              Alert.alert('Error', 'Failed to stop draft');
+              Alert.alert('Error', 'Failed to stop draft and update league status');
             }
           },
         },
@@ -646,7 +846,7 @@ export default function DraftRoomScreen() {
     // Set new timer
     const timer = setTimeout(() => {
       setCurrentPage(0);
-      loadPlayers(0, text, false);
+      loadPlayers(0, text, false, draftState?.tournament_id);
     }, 500);
     
     setSearchDebounceTimer(timer);
@@ -657,7 +857,7 @@ export default function DraftRoomScreen() {
     if (loadingMore) return;
     if (players.length >= totalPlayers) return;
     
-    loadPlayers(currentPage + 1, searchQuery, true);
+    loadPlayers(currentPage + 1, searchQuery, true, draftState?.tournament_id);
   };
 
   const isMyTurn = draftState?.current_team_id === teamId;
@@ -667,8 +867,8 @@ export default function DraftRoomScreen() {
 
   if (loading) {
     return (
-      <View style={styles.loadingContainer}>
-        <ActivityIndicator size="large" color="#2563eb" />
+      <View style={[styles.loadingContainer, { backgroundColor: colors.background }]}>
+        <ActivityIndicator size="large" color={colors.primary} />
       </View>
     );
   }
@@ -677,15 +877,24 @@ export default function DraftRoomScreen() {
     return (
       <>
         <Stack.Screen options={{ headerShown: false }} />
-        <View style={styles.container}>
+        <View style={[styles.container, { backgroundColor: colors.background }]}>
           <View style={styles.completeContainer}>
             <Text style={styles.completeText}>🎉</Text>
-            <Text style={styles.completeTitle}>Draft Finished!</Text>
-            <Text style={styles.completeSubtitle}>
+            <Text style={[styles.completeTitle, { color: colors.text }]}>Draft Finished!</Text>
+            <Text style={[styles.completeSubtitle, { color: colors.textSecondary }]}>
               All picks have been made. Good luck in the tournament!
             </Text>
-            <TouchableOpacity style={styles.completeButton} onPress={() => router.back()}>
-              <Text style={styles.completeButtonText}>Back to League</Text>
+            <TouchableOpacity 
+              style={[styles.completeButton, { backgroundColor: colors.primary }]} 
+              onPress={() => router.push(`/league/${leagueId}`)}
+            >
+              <Text style={styles.completeButtonText}>View {league?.name}</Text>
+            </TouchableOpacity>
+            <TouchableOpacity 
+              style={[styles.completeButton, styles.secondaryButton, { backgroundColor: colors.cardBackground, borderColor: colors.border }]} 
+              onPress={() => router.push('/(tabs)/leagues')}
+            >
+              <Text style={[styles.completeButtonText, styles.secondaryButtonText, { color: colors.primary }]}>Back to My Leagues</Text>
             </TouchableOpacity>
           </View>
         </View>
@@ -696,47 +905,38 @@ export default function DraftRoomScreen() {
   return (
     <>
       <Stack.Screen options={{ headerShown: false }} />
-      <View style={styles.container}>
+      <View style={[styles.container, { backgroundColor: colors.background }]}>
         {/* Header */}
-        <View style={styles.header}>
-          <TouchableOpacity onPress={() => router.back()} style={styles.backButton}>
-            <Text style={styles.backButtonText}>← Back</Text>
+        <View style={[styles.header, { backgroundColor: colors.headerBackground, borderBottomColor: colors.border }]}>
+          <TouchableOpacity onPress={() => router.push('/(tabs)/leagues')} style={styles.backButton}>
+            <Text style={[styles.backButtonText, { color: colors.primary }]}>← My Leagues</Text>
           </TouchableOpacity>
-          <Text style={styles.title}>Draft Room</Text>
-          {isOwner && (
-            <View style={styles.headerButtons}>
-              <TouchableOpacity onPress={restartDraft} style={styles.restartButton}>
-                <Text style={styles.restartButtonText}>Restart</Text>
-              </TouchableOpacity>
-              <TouchableOpacity onPress={stopDraft} style={styles.stopButton}>
-                <Text style={styles.stopButtonText}>Stop</Text>
-              </TouchableOpacity>
-            </View>
-          )}
+          <Text style={[styles.title, { color: colors.text }]}>Draft Room</Text>
+          <View style={{ width: 60 }} />
         </View>
 
         {/* Draft Status */}
-        <View style={[styles.statusBar, isMyTurn && styles.statusBarMyTurn]}>
+        <View style={[styles.statusBar, { backgroundColor: colors.cardBackground, borderBottomColor: colors.border }, isMyTurn && { backgroundColor: '#10b981' }]}>
           <View style={styles.statusLeft}>
-            <Text style={styles.statusLabel}>
+            <Text style={[styles.statusLabel, { color: isMyTurn ? '#fff' : colors.text }]}>
               {isMyTurn ? '🎯 YOUR TURN' : '⏳ Waiting...'}
             </Text>
-            <Text style={styles.statusText}>
+            <Text style={[styles.statusText, { color: isMyTurn ? '#fff' : colors.textSecondary }]}>
               Pick {draftState.current_pick_number} • Round {draftState.current_round}
             </Text>
-            <Text style={styles.statusPicker}>
+            <Text style={[styles.statusPicker, { color: isMyTurn ? 'rgba(255, 255, 255, 0.8)' : colors.textSecondary }]}>
               {currentTeamMember?.profile?.username || 'Unknown'} is picking
             </Text>
           </View>
-          <View style={styles.timerContainer}>
+          <View style={[styles.timerContainer, { backgroundColor: colors.primary }]}>
             <Text style={styles.timerText}>{timeRemaining}s</Text>
           </View>
         </View>
 
         <View style={styles.content}>
           {/* Draft Order Sidebar */}
-          <View style={styles.sidebar}>
-            <Text style={styles.sidebarTitle}>Draft Order</Text>
+          <View style={[styles.sidebar, { backgroundColor: colors.cardBackground, borderRightColor: colors.border }]}>
+            <Text style={[styles.sidebarTitle, { color: colors.text }]}>Draft Order</Text>
             <ScrollView style={styles.sidebarScroll}>
               {draftOrder.map((member, index) => {
                 const isCurrent = member.team_id === draftState.current_team_id;
@@ -752,8 +952,9 @@ export default function DraftRoomScreen() {
                     <TouchableOpacity
                       style={[
                         styles.orderItem,
-                        isCurrent && styles.orderItemCurrent,
-                        isUser && styles.orderItemUser,
+                        { backgroundColor: colors.background },
+                        isCurrent && { backgroundColor: colors.primary + '20' },
+                        isUser && { borderLeftColor: colors.primary },
                       ]}
                       onPress={() => {
                         const newExpanded = new Set(expandedTeams);
@@ -765,29 +966,33 @@ export default function DraftRoomScreen() {
                         setExpandedTeams(newExpanded);
                       }}
                     >
-                      <Text style={styles.orderNumber}>{index + 1}</Text>
+                      <Text style={[styles.orderNumber, { color: colors.textSecondary }]}>{index + 1}</Text>
                       <View style={styles.orderInfo}>
                         <Text
-                          style={[styles.orderName, isCurrent && styles.orderNameCurrent]}
+                          style={[styles.orderName, { color: colors.text }, isCurrent && styles.orderNameCurrent]}
                           numberOfLines={1}
                         >
                           {member.profile?.username}
                           {isUser && ' (You)'}
                         </Text>
-                        <Text style={styles.orderPicks}>{pickCount} picks</Text>
+                        <Text style={[styles.orderPicks, { color: colors.textSecondary }]}>{pickCount} picks</Text>
                       </View>
-                      <Text style={styles.expandArrow}>{isExpanded ? '▼' : '▶'}</Text>
+                      <Text style={[styles.expandArrow, { color: colors.textSecondary }]}>{isExpanded ? '▼' : '▶'}</Text>
                     </TouchableOpacity>
                     {isExpanded && pickCount > 0 && (
-                      <View style={styles.teamPicksList}>
+                      <View style={[styles.teamPicksList, { backgroundColor: colors.background }]}>
                         {teamPicks.map((pick, idx) => (
                           <View key={pick.id} style={styles.teamPickItem}>
-                            <Text style={styles.teamPickNumber}>{idx + 1}.</Text>
-                            <Text style={styles.teamPickName}>
-                              {pick.player?.title && `${pick.player.title} `}
+                            <Text style={[styles.teamPickNumber, { color: colors.textSecondary }]}>{idx + 1}.</Text>
+                            <Text style={[styles.teamPickName, { color: colors.text }]}>
+                              {pick.player?.title && (
+                                <Text style={{ color: getTitleColor(pick.player.title) }}>
+                                  {pick.player.title}{' '}
+                                </Text>
+                              )}
                               {pick.player?.name}
                             </Text>
-                            <Text style={styles.teamPickRating}>{pick.player?.rating}</Text>
+                            <Text style={[styles.teamPickRating, { color: colors.textSecondary }]}>{getRatingForTimeControl(pick.player || { rating: 0 }, league?.time_control)}</Text>
                           </View>
                         ))}
                       </View>
@@ -801,37 +1006,53 @@ export default function DraftRoomScreen() {
           {/* Player Selection */}
           <View style={styles.mainContent}>
             <TextInput
-              style={styles.searchInput}
+              style={[styles.searchInput, { backgroundColor: colors.cardBackground, color: colors.text, borderColor: colors.border }]}
               placeholder="Search players..."
-              placeholderTextColor="#64748b"
+              placeholderTextColor={colors.textSecondary}
               value={searchQuery}
               onChangeText={handleSearch}
             />
 
             <View style={styles.playerListHeader}>
-              <Text style={styles.playerListCount}>
+              <Text style={[styles.playerListCount, { color: colors.textSecondary }]}>
                 {totalPlayers} players available
               </Text>
             </View>
 
             <FlatList
               data={players}
-              keyExtractor={(item) => item.fide_id}
+              keyExtractor={(item, index) => `${item.fide_id}-${index}`}
               renderItem={({ item }) => {
                 const isSelected = selectedPlayer?.fide_id === item.fide_id;
                 return (
                   <TouchableOpacity
-                    style={[styles.playerCard, isSelected && styles.playerCardSelected]}
+                    style={[styles.playerCard, { backgroundColor: colors.cardBackground, borderColor: colors.border }, isSelected && { borderColor: colors.primary, backgroundColor: colors.primary + '10' }]}
                     onPress={() => setSelectedPlayer(item)}
                     disabled={!isMyTurn}
                   >
                     <View style={styles.playerInfo}>
-                      <Text style={styles.playerName}>
-                        {item.title && `${item.title} `}
-                        {item.name}
-                      </Text>
-                      <Text style={styles.playerDetails}>
-                        {item.country} • {item.rating}
+                      <View style={styles.playerNameRow}>
+                        <Text style={[styles.playerName, { color: colors.text }]}>
+                          {item.title && (
+                            <Text style={{ color: getTitleColor(item.title) }}>
+                              {item.title}{' '}
+                            </Text>
+                          )}
+                          {item.name}
+                        </Text>
+                        <TouchableOpacity
+                          onPress={(e) => {
+                            e.stopPropagation();
+                            setSelectedProfilePlayer(item);
+                            setProfileModalVisible(true);
+                          }}
+                          style={styles.infoIconButton}
+                        >
+                          <Text style={[styles.infoIcon, { color: colors.primary }]}>ⓘ</Text>
+                        </TouchableOpacity>
+                      </View>
+                      <Text style={[styles.playerDetails, { color: colors.textSecondary }]}>
+                        {item.country} • {getRatingForTimeControl(item, league?.time_control)}
                       </Text>
                     </View>
                     {isSelected && <Text style={styles.checkmark}>✓</Text>}
@@ -839,18 +1060,18 @@ export default function DraftRoomScreen() {
                 );
               }}
               ListEmptyComponent={
-                <Text style={styles.emptyText}>
+                <Text style={[styles.emptyText, { color: colors.textSecondary }]}>
                   {searchQuery ? 'No players found' : 'No players available'}
                 </Text>
               }
               ListFooterComponent={
                 loadingMore ? (
                   <View style={styles.loadingMore}>
-                    <ActivityIndicator color="#2563eb" />
+                    <ActivityIndicator color={colors.primary} />
                   </View>
                 ) : players.length < totalPlayers ? (
-                  <TouchableOpacity style={styles.loadMoreButton} onPress={handleLoadMore}>
-                    <Text style={styles.loadMoreText}>Load More</Text>
+                  <TouchableOpacity style={[styles.loadMoreButton, { backgroundColor: colors.cardBackground }]} onPress={handleLoadMore}>
+                    <Text style={[styles.loadMoreText, { color: colors.primary }]}>Load More</Text>
                   </TouchableOpacity>
                 ) : null
               }
@@ -861,7 +1082,7 @@ export default function DraftRoomScreen() {
             {/* Pick Button */}
             {isMyTurn && selectedPlayer && (
               <TouchableOpacity
-                style={[styles.pickButton, pickingInProgress && styles.pickButtonDisabled]}
+                style={[styles.pickButton, { backgroundColor: colors.primary }, pickingInProgress && styles.pickButtonDisabled]}
                 onPress={handlePickPlayer}
                 disabled={pickingInProgress}
               >
@@ -877,6 +1098,18 @@ export default function DraftRoomScreen() {
           </View>
         </View>
       </View>
+
+      {/* Player Profile Modal */}
+      {selectedProfilePlayer && (
+        <PlayerProfileModal
+          visible={profileModalVisible}
+          player={selectedProfilePlayer}
+          onClose={() => {
+            setProfileModalVisible(false);
+            setSelectedProfilePlayer(null);
+          }}
+        />
+      )}
     </>
   );
 }
@@ -1079,11 +1312,24 @@ const styles = StyleSheet.create({
   playerInfo: {
     flex: 1,
   },
+  playerNameRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 4,
+  },
   playerName: {
     fontSize: 16,
     fontWeight: '600',
     color: '#fff',
-    marginBottom: 4,
+    flex: 1,
+  },
+  infoIconButton: {
+    padding: 6,
+    marginLeft: 6,
+  },
+  infoIcon: {
+    fontSize: 18,
+    color: '#60a5fa',
   },
   playerDetails: {
     fontSize: 14,
@@ -1142,11 +1388,20 @@ const styles = StyleSheet.create({
     borderRadius: 8,
     paddingVertical: 12,
     paddingHorizontal: 32,
+    marginBottom: 12,
   },
   completeButtonText: {
     color: '#fff',
     fontSize: 16,
     fontWeight: 'bold',
+  },
+  secondaryButton: {
+    backgroundColor: 'transparent',
+    borderWidth: 1,
+    borderColor: '#2563eb',
+  },
+  secondaryButtonText: {
+    color: '#2563eb',
   },
   loadingMore: {
     padding: 16,
@@ -1192,6 +1447,10 @@ const styles = StyleSheet.create({
     fontSize: 13,
     color: '#cbd5e1',
     flex: 1,
+  },
+  teamPickInfoButton: {
+    padding: 4,
+    marginHorizontal: 6,
   },
   teamPickRating: {
     fontSize: 12,

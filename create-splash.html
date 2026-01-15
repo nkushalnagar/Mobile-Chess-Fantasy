@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Create Splash Screen</title>
+</head>
+<body>
+    <canvas id="canvas" width="1284" height="2778"></canvas>
+    <script>
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        
+        // Fill background with dark blue
+        ctx.fillStyle = '#0f172a';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        
+        // Add "Fantasy Chess" text at top
+        ctx.fillStyle = '#ffffff';
+        ctx.font = 'bold 80px Arial';
+        ctx.textAlign = 'center';
+        ctx.fillText('Fantasy Chess', canvas.width / 2, 400);
+        
+        // Instructions
+        ctx.font = '40px Arial';
+        ctx.fillText('Place your logo in the center', canvas.width / 2, canvas.height / 2);
+        ctx.fillText('Then download this as splash.png', canvas.width / 2, canvas.height / 2 + 60);
+        
+        // Download button
+        setTimeout(() => {
+            const link = document.createElement('a');
+            link.download = 'splash.png';
+            link.href = canvas.toDataURL();
+            link.click();
+        }, 1000);
+    </script>
+</body>
+</html>

@@ -1,9 +1,10 @@
-import React, { useEffect, useState } from 'react';
-import { View, Text, StyleSheet, ScrollView, ActivityIndicator, TouchableOpacity, TextInput, Alert, Switch } from 'react-native';
+import React, { useEffect, useState, useRef } from 'react';
+import { View, Text, StyleSheet, ScrollView, ActivityIndicator, TouchableOpacity, TextInput, Alert, Switch, KeyboardAvoidingView, Platform, Modal } from 'react-native';
 import { useLocalSearchParams, useRouter, Stack } from 'expo-router';
-import Slider from '@react-native-community/slider';
+import NumberStepper from '@/components/NumberStepper';
 import { supabase } from '@/lib/supabase';
 import { useAuth } from '@/contexts/AuthContext';
+import { useTheme } from '@/contexts/ThemeContext';
 
 interface League {
   id: string;
@@ -14,6 +15,7 @@ interface League {
   status: string;
   draft_scheduled_time: string | null;
   created_at: string;
+  is_public?: boolean;
 }
 
 interface LeagueSettings {
@@ -26,20 +28,32 @@ interface LeagueSettings {
 
 type SettingsTab = 'basic' | 'advanced';
 
-export default function LeagueSettingsScreen() {
-  const { id } = useLocalSearchParams();
+interface LeagueSettingsProps {
+  leagueId?: string;
+  onClose?: () => void;
+}
+
+export default function LeagueSettingsScreen({ leagueId, onClose }: LeagueSettingsProps = {}) {
+  const params = useLocalSearchParams();
+  const id = leagueId || params.id;
+  const tab = params.tab;
   const router = useRouter();
   const { user } = useAuth();
+  const { colors } = useTheme();
   const [league, setLeague] = useState<League | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
   const [isOwner, setIsOwner] = useState(false);
   const [isEditing, setIsEditing] = useState(false);
   const [activeTab, setActiveTab] = useState<SettingsTab>('basic');
   const [maxMembers, setMaxMembers] = useState('10');
   const [picksPerPerson, setPicksPerPerson] = useState('5');
   const [inviteUsername, setInviteUsername] = useState('');
+  const [inviteEmail, setInviteEmail] = useState('');
+  const [inviteMode, setInviteMode] = useState<'username' | 'email'>('username');
   const [teamName, setTeamName] = useState('');
   const [teamId, setTeamId] = useState<string | null>(null);
+  const [showDeleteModal, setShowDeleteModal] = useState(false);
+  const [deleteConfirmText, setDeleteConfirmText] = useState('');
   
   // Advanced settings
   const [fantasySettings, setFantasySettings] = useState<LeagueSettings>({
@@ -50,14 +64,45 @@ export default function LeagueSettingsScreen() {
     psychological_weight: 4,
   });
   const [savingAdvanced, setSavingAdvanced] = useState(false);
+  const [loadingAdvanced, setLoadingAdvanced] = useState(false);
+  const [settingsLoaded, setSettingsLoaded] = useState(false);
+  const [renderSliders, setRenderSliders] = useState(false);
+
+  // Cache loaded state per league to prevent reloading
+  const loadedRef = useRef<Set<string>>(new Set());
+  const isInitializedRef = useRef(false);
 
   useEffect(() => {
-    fetchLeagueSettings();
-    fetchUserTeam();
-    if (activeTab === 'advanced') {
+    const leagueKey = `${id}`;
+    
+    // Only load if not already loaded for this league
+    if (!loadedRef.current.has(leagueKey)) {
+      setLoading(true);
+      fetchLeagueSettings();
+      fetchUserTeam();
+      loadedRef.current.add(leagueKey);
+      isInitializedRef.current = true;
+    }
+    
+    // Load advanced settings only when switching to advanced tab and not already loaded
+    if (activeTab === 'advanced' && !settingsLoaded) {
       fetchFantasySettings();
     }
   }, [id, activeTab]);
+
+  // Control slider rendering - unmount when leaving advanced tab, remount when entering
+  useEffect(() => {
+    if (activeTab === 'advanced' && settingsLoaded) {
+      // Small delay to ensure state is updated before rendering sliders
+      setRenderSliders(false);
+      const timer = setTimeout(() => {
+        setRenderSliders(true);
+      }, 50);
+      return () => clearTimeout(timer);
+    } else {
+      setRenderSliders(false);
+    }
+  }, [activeTab, settingsLoaded, fantasySettings]);
 
   const fetchLeagueSettings = async () => {
     try {
@@ -129,6 +174,7 @@ export default function LeagueSettingsScreen() {
   };
 
   const fetchFantasySettings = async () => {
+    setLoadingAdvanced(true);
     try {
       const { data, error } = await supabase
         .from('league_settings')
@@ -146,9 +192,12 @@ export default function LeagueSettingsScreen() {
           color_weight: data.color_weight,
           psychological_weight: data.psychological_weight,
         });
+        setSettingsLoaded(true);
       }
     } catch (error) {
       console.error('Error fetching fantasy settings:', error);
+    } finally {
+      setLoadingAdvanced(false);
     }
   };
 
@@ -184,6 +233,9 @@ export default function LeagueSettingsScreen() {
 
       if (error) throw error;
 
+      // Notify all league members about settings change
+      await notifyLeagueMembers('League fantasy scoring settings have been updated');
+
       Alert.alert('Success', 'Fantasy points settings updated');
       fetchFantasySettings();
     } catch (error) {
@@ -194,19 +246,64 @@ export default function LeagueSettingsScreen() {
     }
   };
 
+  const notifyLeagueMembers = async (message: string) => {
+    try {
+      console.log('Calling notification function with:', { league_id: id, message });
+      
+      const { data, error } = await supabase.functions.invoke('send-league-notifications', {
+        body: {
+          league_id: id,
+          message: message,
+          notification_type: 'league_settings_changed',
+          exclude_user_id: user?.id
+        }
+      });
+
+      if (error) {
+        console.error('❌ Error calling notification function:', JSON.stringify(error, null, 2));
+        Alert.alert('Warning', 'Settings saved but failed to notify members');
+      } else {
+        console.log('✅ Notifications sent successfully:', data);
+      }
+    } catch (error) {
+      console.error('❌ Exception notifying league members:', error);
+      Alert.alert('Warning', 'Settings saved but failed to notify members');
+    }
+  };
+
   const handleSaveSettings = async () => {
     if (!isOwner) return;
 
     try {
+      // Check current member count
+      const { count: memberCount } = await supabase
+        .from('league_memberships')
+        .select('*', { count: 'exact' })
+        .eq('league_id', id);
+
+      const newMaxMembers = parseInt(maxMembers);
+      
+      // Prevent reducing max_members below current member count
+      if (memberCount && newMaxMembers < memberCount) {
+        Alert.alert(
+          'Error',
+          `Cannot set max members to ${newMaxMembers}. There are currently ${memberCount} members in the league.`
+        );
+        return;
+      }
+
       const { error } = await supabase
         .from('leagues')
         .update({
-          max_members: parseInt(maxMembers),
+          max_members: newMaxMembers,
           picks_per_person: parseInt(picksPerPerson),
         })
         .eq('id', id);
 
       if (error) throw error;
+
+      // Notify all league members about settings change
+      await notifyLeagueMembers('League settings have been updated');
 
       Alert.alert('Success', 'League settings updated');
       setIsEditing(false);
@@ -221,6 +318,17 @@ export default function LeagueSettingsScreen() {
     if (!inviteUsername.trim() || !user) return;
 
     try {
+      // Check if league is at max capacity
+      const { count: memberCount } = await supabase
+        .from('league_memberships')
+        .select('*', { count: 'exact' })
+        .eq('league_id', id);
+
+      if (memberCount && league && memberCount >= league.max_members) {
+        Alert.alert('Error', 'League is at maximum capacity. Cannot send more invites.');
+        return;
+      }
+
       // Check if user exists
       const { data: inviteeProfile, error: profileError } = await supabase
         .from('profiles')
@@ -266,18 +374,125 @@ export default function LeagueSettingsScreen() {
     }
   };
 
+  const handleInviteByEmail = async () => {
+    if (!inviteEmail.trim() || !user) return;
+
+    // Validate email format
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(inviteEmail)) {
+      Alert.alert('Error', 'Please enter a valid email address');
+      return;
+    }
+
+    try {
+      // Check if league is at max capacity
+      const { count: memberCount } = await supabase
+        .from('league_memberships')
+        .select('*', { count: 'exact' })
+        .eq('league_id', id);
+
+      if (memberCount && league && memberCount >= league.max_members) {
+        Alert.alert('Error', 'League is at maximum capacity. Cannot send more invites.');
+        return;
+      }
+
+      // Check if already invited by email
+      const { count } = await supabase
+        .from('email_invites')
+        .select('*', { count: 'exact' })
+        .eq('league_id', id)
+        .eq('invitee_email', inviteEmail)
+        .eq('status', 'pending');
+
+      if (count && count > 0) {
+        Alert.alert('Error', 'This email has already been invited');
+        return;
+      }
+
+      // Send email invite via Edge Function
+      const { data, error } = await supabase.functions.invoke('send-email-invite', {
+        body: {
+          league_id: id,
+          inviter_id: user.id,
+          invitee_email: inviteEmail,
+        },
+      });
+
+      if (error) throw error;
+
+      if (data.user_exists) {
+        // User already exists - they received an in-app notification instead
+        Alert.alert(
+          'Invite Sent',
+          `${data.username || 'User'} already has an account. They've been sent an in-app notification to join the league.`
+        );
+        setInviteEmail('');
+        return;
+      }
+
+      if (data.email_sent === false) {
+        // Email invite created but email failed to send
+        Alert.alert(
+          'Invite Created',
+          data.warning || 'Invite created but email failed to send. Email service may need configuration.'
+        );
+        setInviteEmail('');
+        return;
+      }
+
+      // Email sent successfully
+      Alert.alert('Success', `Invite email sent to ${inviteEmail}`);
+      setInviteEmail('');
+    } catch (error) {
+      console.error('Error sending email invite:', error);
+      Alert.alert('Error', 'Failed to send email invite');
+    }
+  };
+
+  const handleDeleteLeague = () => {
+    setShowDeleteModal(true);
+    setDeleteConfirmText('');
+  };
+
+  const confirmDeleteLeague = () => {
+    if (deleteConfirmText.toLowerCase() === 'delete') {
+      setShowDeleteModal(false);
+      deleteLeague();
+    } else {
+      Alert.alert('Error', 'Please type "delete" to confirm');
+    }
+  };
+
+  const deleteLeague = async () => {
+    try {
+      const { error } = await supabase
+        .from('leagues')
+        .delete()
+        .eq('id', id);
+
+      if (error) throw error;
+
+      Alert.alert('Success', 'League deleted successfully', [
+        { text: 'OK', onPress: () => onClose ? onClose() : router.push('/(tabs)/leagues') }
+      ]);
+    } catch (error) {
+      console.error('Error deleting league:', error);
+      Alert.alert('Error', 'Failed to delete league');
+    }
+  };
+
   if (loading) {
     return (
-      <View style={styles.loadingContainer}>
-        <ActivityIndicator size="large" color="#2563eb" />
+      <View style={[styles.loadingContainer, { backgroundColor: colors.background }]}>
+        <ActivityIndicator size="large" color={colors.primary} />
       </View>
     );
   }
 
   if (!league) {
     return (
-      <View style={styles.loadingContainer}>
-        <Text style={styles.errorText}>League not found</Text>
+      <View style={[styles.loadingContainer, { backgroundColor: colors.background }]}>
+        <Text style={[styles.errorText, { color: colors.text }]}>League not found</Text>
       </View>
     );
   }
@@ -285,31 +500,34 @@ export default function LeagueSettingsScreen() {
   return (
     <>
       <Stack.Screen options={{ headerShown: false }} />
-      <ScrollView style={styles.container}>
+      <KeyboardAvoidingView 
+        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+        style={{ flex: 1, backgroundColor: colors.background }}
+      >
+        <ScrollView style={[styles.container, { backgroundColor: colors.background }]}>
         {/* Header */}
-        <View style={styles.header}>
-        <TouchableOpacity onPress={() => router.back()} style={styles.backButton}>
-          <Text style={styles.backButtonText}>← Back</Text>
+        <View style={[styles.header, { backgroundColor: colors.headerBackground, borderBottomColor: colors.border }]}>
+        <TouchableOpacity onPress={() => onClose ? onClose() : router.push(`/league/${id}?tab=${tab || 'matchups'}`)} style={styles.backButton}>
+          <Text style={[styles.backButtonText, { color: colors.text }]}>{onClose ? '✕' : '←'}</Text>
         </TouchableOpacity>
-        <Text style={styles.title}>League Settings</Text>
       </View>
 
       {/* Tabs */}
       {isOwner && (
-        <View style={styles.tabBar}>
+        <View style={[styles.tabBar, { backgroundColor: colors.cardBackground, borderBottomColor: colors.border }]}>
           <TouchableOpacity
-            style={[styles.tab, activeTab === 'basic' && styles.activeTab]}
+            style={[styles.tab, activeTab === 'basic' && { ...styles.activeTab, backgroundColor: colors.primary }]}
             onPress={() => setActiveTab('basic')}
           >
-            <Text style={[styles.tabText, activeTab === 'basic' && styles.activeTabText]}>
+            <Text style={[styles.tabText, { color: colors.textSecondary }, activeTab === 'basic' && { ...styles.activeTabText, color: '#fff' }]}>
               Basic
             </Text>
           </TouchableOpacity>
           <TouchableOpacity
-            style={[styles.tab, activeTab === 'advanced' && styles.activeTab]}
+            style={[styles.tab, activeTab === 'advanced' && { ...styles.activeTab, backgroundColor: colors.primary }]}
             onPress={() => setActiveTab('advanced')}
           >
-            <Text style={[styles.tabText, activeTab === 'advanced' && styles.activeTabText]}>
+            <Text style={[styles.tabText, { color: colors.textSecondary }, activeTab === 'advanced' && { ...styles.activeTabText, color: '#fff' }]}>
               Advanced
             </Text>
           </TouchableOpacity>
@@ -319,18 +537,17 @@ export default function LeagueSettingsScreen() {
       {/* Team Name - All members can edit */}
       {activeTab === 'basic' && teamId && (
         <View style={styles.section}>
-          <Text style={styles.sectionTitle}>Your Team</Text>
           <View style={styles.inputGroup}>
-            <Text style={styles.label}>Team Name</Text>
+            <Text style={[styles.label, { color: colors.text }]}>Team Name</Text>
             <TextInput
-              style={styles.input}
+              style={[styles.input, { backgroundColor: colors.cardBackground, borderColor: colors.border, color: colors.text }]}
               value={teamName}
               onChangeText={setTeamName}
               placeholder="Enter team name"
-              placeholderTextColor="#64748b"
+              placeholderTextColor={colors.textTertiary}
             />
             <TouchableOpacity
-              style={styles.saveTeamButton}
+              style={[styles.saveTeamButton, { backgroundColor: colors.primary }]}
               onPress={updateTeamName}
             >
               <Text style={styles.saveTeamButtonText}>Save Team Name</Text>
@@ -342,78 +559,59 @@ export default function LeagueSettingsScreen() {
       {/* League Info - Only show on Basic tab */}
       {activeTab === 'basic' && (
         <View style={styles.section}>
-          <Text style={styles.sectionTitle}>Information</Text>
-          <View style={styles.infoCard}>
+          <View style={[styles.infoCard, { backgroundColor: colors.cardBackground, borderColor: colors.border }]}>
             <View style={styles.infoRow}>
-              <Text style={styles.infoLabel}>League Name:</Text>
-              <Text style={styles.infoValue}>{league.name}</Text>
+              <Text style={[styles.infoLabel, { color: colors.textSecondary }]}>League Name:</Text>
+              <Text style={[styles.infoValue, { color: colors.text }]} numberOfLines={1} ellipsizeMode="tail">{league.name}</Text>
             </View>
             <View style={styles.infoRow}>
-              <Text style={styles.infoLabel}>Status:</Text>
-              <Text style={styles.infoValue}>{league.status}</Text>
+              <Text style={[styles.infoLabel, { color: colors.textSecondary }]}>Status:</Text>
+              <Text style={[styles.infoValue, { color: colors.text }]}>{league.status}</Text>
             </View>
             <View style={styles.infoRow}>
-              <Text style={styles.infoLabel}>Created:</Text>
-              <Text style={styles.infoValue}>
-                {new Date(league.created_at).toLocaleDateString()}
-              </Text>
+              <Text style={[styles.infoLabel, { color: colors.textSecondary }]}>Created:</Text>
+              <Text style={[styles.infoValue, { color: colors.text }]}>{new Date(league.created_at).toLocaleDateString()}</Text>
             </View>
           </View>
-        </View>
-      )}
 
-      {/* Basic Settings Tab */}
-      {activeTab === 'basic' && isOwner && (
-        <View style={styles.section}>
-          <Text style={styles.sectionTitle}>League Settings</Text>
-          
-          <View style={styles.settingsCard}>
-            {/* Max Members Slider */}
-            <View style={styles.sliderContainer}>
-              <View style={styles.sliderHeader}>
-                <Text style={styles.sliderLabel}>Max Members</Text>
-                <Text style={styles.sliderValue}>{Math.round(parseInt(maxMembers))}</Text>
-              </View>
-              <Slider
-                style={styles.slider}
+          {/* Max Members Slider - Only show to owner */}
+          {isOwner && (
+            <View style={[styles.sliderContainer, { marginTop: 24 }]}>
+              <Text style={[styles.sliderLabel, { marginBottom: 4 }]}>Max Members</Text>
+              <Text style={[styles.sliderDescription, { marginBottom: 12 }]}>
+                Maximum number of members allowed in this league
+              </Text>
+              <NumberStepper
+                value={parseInt(maxMembers)}
+                onValueChange={(value: number) => setMaxMembers(value.toString())}
                 minimumValue={2}
                 maximumValue={50}
                 step={1}
-                value={parseInt(maxMembers)}
-                onValueChange={(value) => setMaxMembers(value.toString())}
-                minimumTrackTintColor="#2563eb"
-                maximumTrackTintColor="#334155"
-                thumbTintColor="#2563eb"
+                color={colors.primary}
               />
-              <Text style={styles.sliderDescription}>
-                Maximum number of members allowed in this league
-              </Text>
             </View>
+          )}
 
-            {/* Picks Per Person Slider */}
+          {/* Picks Per Person Slider - Only show to owner */}
+          {isOwner && (
             <View style={styles.sliderContainer}>
-              <View style={styles.sliderHeader}>
-                <Text style={styles.sliderLabel}>Picks Per Person</Text>
-                <Text style={styles.sliderValue}>{Math.round(parseInt(picksPerPerson))}</Text>
-              </View>
-              <Slider
-                style={styles.slider}
+              <Text style={[styles.sliderLabel, { marginBottom: 4 }]}>Picks Per Person</Text>
+              <Text style={[styles.sliderDescription, { marginBottom: 12 }]}>
+                Number of players each member can draft
+              </Text>
+              <NumberStepper
+                value={parseInt(picksPerPerson)}
+                onValueChange={(value: number) => setPicksPerPerson(value.toString())}
                 minimumValue={1}
                 maximumValue={20}
                 step={1}
-                value={parseInt(picksPerPerson)}
-                onValueChange={(value) => setPicksPerPerson(value.toString())}
-                minimumTrackTintColor="#2563eb"
-                maximumTrackTintColor="#334155"
-                thumbTintColor="#2563eb"
+                color={colors.primary}
               />
-              <Text style={styles.sliderDescription}>
-                Number of players each member can draft
-              </Text>
             </View>
-          </View>
+          )}
 
-          {/* Save Button */}
+          {/* Save Button - Only show to owner */}
+          {isOwner && (
           <TouchableOpacity
             onPress={handleSaveSettings}
             style={styles.saveAdvancedButton}
@@ -422,21 +620,20 @@ export default function LeagueSettingsScreen() {
               Save League Settings
             </Text>
           </TouchableOpacity>
+          )}
         </View>
       )}
 
       {/* Advanced Settings Tab */}
       {activeTab === 'advanced' && isOwner && (
         <View style={styles.section}>
-          <Text style={styles.sectionTitle}>Fantasy Points Settings</Text>
-
           {/* Prestige Factor Toggle */}
-          <View style={styles.settingsCard}>
+          <View style={[styles.settingsCard, { backgroundColor: colors.cardBackground, borderColor: colors.border }]}>
             <View style={styles.settingRow}>
               <View style={styles.settingLabelContainer}>
                 <Text style={styles.settingLabel}>Use Prestige Factor</Text>
                 <Text style={styles.settingDescription}>
-                  Multiply points by tournament prize fund / 10,000
+                  Multiply points by tournament prize fund / 100,000
                 </Text>
               </View>
               <Switch
@@ -451,117 +648,94 @@ export default function LeagueSettingsScreen() {
           </View>
 
           {/* Weight Sliders */}
-          <View style={[styles.settingsCard, styles.weightSlidersCard]}>
-            <Text style={styles.subsectionTitle}>Game Factor Weights (out of 100)</Text>
+          <View style={[styles.settingsCard, styles.weightSlidersCard, { backgroundColor: colors.cardBackground, borderColor: colors.border }]}>
+            <Text style={[styles.subsectionTitle, { color: colors.text }]}>Fantasy Score Weights</Text>
             
             {/* Rating Weight */}
             <View style={styles.sliderContainer}>
-              <View style={styles.sliderHeader}>
-                <Text style={styles.sliderLabel}>Rating Change</Text>
-                <Text style={styles.sliderValue}>{Math.round(fantasySettings.rating_weight)}</Text>
-              </View>
-              <Slider
-                style={styles.slider}
+              <Text style={[styles.sliderLabel, { color: colors.text, marginBottom: 4 }]}>Rating Change</Text>
+              <Text style={[styles.sliderDescription, { color: colors.textSecondary, marginBottom: 12 }]}>
+                Points from rating gain/loss (upsets and performance)
+              </Text>
+              <NumberStepper
+                value={Math.round(fantasySettings.rating_weight)}
+                onValueChange={(value: number) =>
+                  setFantasySettings({ ...fantasySettings, rating_weight: value })
+                }
                 minimumValue={0}
                 maximumValue={100}
                 step={1}
-                value={fantasySettings.rating_weight}
-                onValueChange={(value) =>
-                  setFantasySettings({ ...fantasySettings, rating_weight: value })
-                }
-                minimumTrackTintColor="#2563eb"
-                maximumTrackTintColor="#334155"
-                thumbTintColor="#2563eb"
+                color={colors.primary}
               />
-              <Text style={styles.sliderDescription}>
-                Points from rating gain/loss (upsets and performance)
-              </Text>
             </View>
 
             {/* Sharpe Weight */}
             <View style={styles.sliderContainer}>
-              <View style={styles.sliderHeader}>
-                <Text style={styles.sliderLabel}>Game Quality</Text>
-                <Text style={styles.sliderValue}>{Math.round(fantasySettings.sharpe_weight)}</Text>
-              </View>
-              <Slider
-                style={styles.slider}
+              <Text style={[styles.sliderLabel, { color: colors.text, marginBottom: 4 }]}>Game Quality</Text>
+              <Text style={[styles.sliderDescription, { color: colors.textSecondary, marginBottom: 12 }]}>
+                Consistency and quality of moves throughout the game
+              </Text>
+              <NumberStepper
+                value={fantasySettings.sharpe_weight}
+                onValueChange={(value: number) =>
+                  setFantasySettings({ ...fantasySettings, sharpe_weight: value })
+                }
                 minimumValue={0}
                 maximumValue={100}
                 step={1}
-                value={fantasySettings.sharpe_weight}
-                onValueChange={(value) =>
-                  setFantasySettings({ ...fantasySettings, sharpe_weight: value })
-                }
-                minimumTrackTintColor="#2563eb"
-                maximumTrackTintColor="#334155"
-                thumbTintColor="#2563eb"
+                color={colors.primary}
               />
-              <Text style={styles.sliderDescription}>
-                Consistency and quality of moves throughout the game
-              </Text>
             </View>
 
             {/* Color Weight */}
             <View style={styles.sliderContainer}>
-              <View style={styles.sliderHeader}>
-                <Text style={styles.sliderLabel}>Color Factor</Text>
-                <Text style={styles.sliderValue}>{Math.round(fantasySettings.color_weight)}</Text>
-              </View>
-              <Slider
-                style={styles.slider}
+              <Text style={[styles.sliderLabel, { color: colors.text, marginBottom: 4 }]}>Color Factor</Text>
+              <Text style={[styles.sliderDescription, { color: colors.textSecondary, marginBottom: 12 }]}>
+                Bonus for winning with black, penalty for losing with white
+              </Text>
+              <NumberStepper
+                value={fantasySettings.color_weight}
+                onValueChange={(value: number) =>
+                  setFantasySettings({ ...fantasySettings, color_weight: value })
+                }
                 minimumValue={0}
                 maximumValue={100}
                 step={1}
-                value={fantasySettings.color_weight}
-                onValueChange={(value) =>
-                  setFantasySettings({ ...fantasySettings, color_weight: value })
-                }
-                minimumTrackTintColor="#2563eb"
-                maximumTrackTintColor="#334155"
-                thumbTintColor="#2563eb"
+                color={colors.primary}
               />
-              <Text style={styles.sliderDescription}>
-                Bonus for winning with black, penalty for losing with white
-              </Text>
             </View>
 
             {/* Psychological Weight */}
             <View style={styles.sliderContainer}>
-              <View style={styles.sliderHeader}>
-                <Text style={styles.sliderLabel}>Psychological Factor</Text>
-                <Text style={styles.sliderValue}>{Math.round(fantasySettings.psychological_weight)}</Text>
-              </View>
-              <Slider
-                style={styles.slider}
+              <Text style={[styles.sliderLabel, { color: colors.text, marginBottom: 4 }]}>Psychological Factor</Text>
+              <Text style={[styles.sliderDescription, { color: colors.textSecondary, marginBottom: 12 }]}>
+                Points based on performance vs recent form
+              </Text>
+              <NumberStepper
+                value={fantasySettings.psychological_weight}
+                onValueChange={(value: number) =>
+                  setFantasySettings({ ...fantasySettings, psychological_weight: value })
+                }
                 minimumValue={0}
                 maximumValue={100}
                 step={1}
-                value={fantasySettings.psychological_weight}
-                onValueChange={(value) =>
-                  setFantasySettings({ ...fantasySettings, psychological_weight: value })
-                }
-                minimumTrackTintColor="#2563eb"
-                maximumTrackTintColor="#334155"
-                thumbTintColor="#2563eb"
+                color={colors.primary}
               />
-              <Text style={styles.sliderDescription}>
-                Points based on performance vs recent form
-              </Text>
             </View>
 
             {/* Total Weight Display */}
             <View style={styles.totalWeightContainer}>
-              <Text style={styles.totalWeightLabel}>Total Weight:</Text>
+              <Text style={[styles.totalWeightLabel, { color: colors.text }]}>Total Weight:</Text>
               <Text style={[
                 styles.totalWeightValue,
-                !isWeightValid() && styles.totalWeightInvalid
+                { color: colors.primary },
+                !isWeightValid() && { ...styles.totalWeightInvalid, color: '#ef4444' }
               ]}>
                 {getTotalWeight()} / 100
               </Text>
             </View>
             {!isWeightValid() && (
-              <Text style={styles.weightWarning}>
+              <Text style={[styles.weightWarning, { color: '#ef4444' }]}>
                 Total weight must equal 100 to save
               </Text>
             )}
@@ -583,50 +757,102 @@ export default function LeagueSettingsScreen() {
         </View>
       )}
 
-      {/* Invite Users (Owner Only) */}
-      {activeTab === 'basic' && isOwner && (
-        <View style={styles.section}>
-          <Text style={styles.sectionTitle}>Invite Users</Text>
-          <View style={styles.inviteCard}>
-            <TextInput
-              style={styles.inviteInput}
-              value={inviteUsername}
-              onChangeText={setInviteUsername}
-              placeholder="Enter username"
-              placeholderTextColor="#64748b"
-              autoCapitalize="none"
-            />
-            <TouchableOpacity
-              onPress={handleInviteUser}
-              style={styles.inviteButton}
-              disabled={!inviteUsername.trim()}
-            >
-              <Text style={styles.inviteButtonText}>Send Invite</Text>
-            </TouchableOpacity>
-          </View>
-        </View>
-      )}
 
       {/* Non-Owner View */}
       {!isOwner && (
         <View style={styles.section}>
-          <Text style={styles.sectionTitle}>Current Settings</Text>
-          <View style={styles.infoCard}>
+          <Text style={[styles.sectionTitle, { color: colors.text }]}>League Settings</Text>
+          <View style={[styles.infoCard, { backgroundColor: colors.cardBackground, borderColor: colors.border }]}>
             <View style={styles.infoRow}>
-              <Text style={styles.infoLabel}>Max Members:</Text>
-              <Text style={styles.infoValue}>{league.max_members}</Text>
+              <Text style={[styles.infoLabel, { color: colors.textSecondary }]}>Max Members:</Text>
+              <Text style={[styles.infoValue, { color: colors.text }]}>{league.max_members}</Text>
             </View>
             <View style={styles.infoRow}>
-              <Text style={styles.infoLabel}>Picks Per Person:</Text>
-              <Text style={styles.infoValue}>{league.picks_per_person}</Text>
+              <Text style={[styles.infoLabel, { color: colors.textSecondary }]}>Picks Per Person:</Text>
+              <Text style={[styles.infoValue, { color: colors.text }]}>{league.picks_per_person}</Text>
             </View>
           </View>
-          <Text style={styles.notOwnerText}>
+
+          <Text style={[styles.sectionTitle, styles.subsectionTitle, { marginTop: 24, color: colors.text }]}>Fantasy Score Weights</Text>
+          <View style={[styles.infoCard, { backgroundColor: colors.cardBackground, borderColor: colors.border }]}>
+            <View style={styles.infoRow}>
+              <Text style={[styles.infoLabel, { color: colors.textSecondary }]}>Prestige Factor:</Text>
+              <Text style={[styles.infoValue, { color: colors.text }]}>
+                {fantasySettings.use_prestige_factor ? 'Enabled' : 'Disabled'}
+              </Text>
+            </View>
+            <View style={styles.infoRow}>
+              <Text style={[styles.infoLabel, { color: colors.textSecondary }]}>Rating Change:</Text>
+              <Text style={[styles.infoValue, { color: colors.text }]}>{Math.round(fantasySettings.rating_weight)}</Text>
+            </View>
+            <View style={styles.infoRow}>
+              <Text style={[styles.infoLabel, { color: colors.textSecondary }]}>Game Quality:</Text>
+              <Text style={[styles.infoValue, { color: colors.text }]}>{Math.round(fantasySettings.sharpe_weight)}</Text>
+            </View>
+            <View style={styles.infoRow}>
+              <Text style={[styles.infoLabel, { color: colors.textSecondary }]}>Color Advantage:</Text>
+              <Text style={[styles.infoValue, { color: colors.text }]}>{Math.round(fantasySettings.color_weight)}</Text>
+            </View>
+            <View style={styles.infoRow}>
+              <Text style={[styles.infoLabel, { color: colors.textSecondary }]}>Psychological Impact:</Text>
+              <Text style={[styles.infoValue, { color: colors.text }]}>{Math.round(fantasySettings.psychological_weight)}</Text>
+            </View>
+          </View>
+
+          <Text style={[styles.notOwnerText, { color: colors.textSecondary }]}>
             Only the league owner can modify settings
           </Text>
         </View>
       )}
       </ScrollView>
+    </KeyboardAvoidingView>
+
+    {/* Delete Confirmation Modal */}
+    <Modal
+      visible={showDeleteModal}
+      transparent={true}
+      animationType="fade"
+      onRequestClose={() => setShowDeleteModal(false)}
+    >
+      <View style={styles.modalOverlay}>
+        <View style={styles.deleteModalContent}>
+          <Text style={styles.deleteModalTitle}>Delete League</Text>
+          <Text style={styles.deleteModalText}>
+            This action cannot be undone. All league data will be permanently deleted.
+          </Text>
+          <Text style={styles.deleteModalText}>
+            Type <Text style={styles.deleteKeyword}>delete</Text> to confirm:
+          </Text>
+          <TextInput
+            style={styles.deleteInput}
+            value={deleteConfirmText}
+            onChangeText={setDeleteConfirmText}
+            placeholder="Type 'delete' here"
+            placeholderTextColor="#64748b"
+            autoCapitalize="none"
+            autoCorrect={false}
+          />
+          <View style={styles.deleteModalButtons}>
+            <TouchableOpacity
+              style={styles.deleteCancelButton}
+              onPress={() => setShowDeleteModal(false)}
+            >
+              <Text style={styles.deleteCancelButtonText}>Cancel</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[
+                styles.deleteConfirmButton,
+                deleteConfirmText.toLowerCase() !== 'delete' && styles.deleteConfirmButtonDisabled
+              ]}
+              onPress={confirmDeleteLeague}
+              disabled={deleteConfirmText.toLowerCase() !== 'delete'}
+            >
+              <Text style={styles.deleteConfirmButtonText}>Delete Forever</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </View>
+    </Modal>
     </>
   );
 }
@@ -638,7 +864,6 @@ const styles = StyleSheet.create({
   },
   loadingContainer: {
     flex: 1,
-    backgroundColor: '#0f172a',
     justifyContent: 'center',
     alignItems: 'center',
   },
@@ -652,11 +877,10 @@ const styles = StyleSheet.create({
   },
   backButton: {
     padding: 8,
-    marginBottom: 8,
   },
   backButtonText: {
     color: '#2563eb',
-    fontSize: 16,
+    fontSize: 24,
     fontWeight: '600',
   },
   title: {
@@ -770,17 +994,44 @@ const styles = StyleSheet.create({
     textAlign: 'right',
   },
   inviteCard: {
-    backgroundColor: '#1e293b',
     borderRadius: 12,
     padding: 16,
     gap: 12,
   },
+  inviteModeToggle: {
+    flexDirection: 'row',
+    borderRadius: 8,
+    padding: 4,
+    marginBottom: 16,
+  },
+  modeButton: {
+    flex: 1,
+    paddingVertical: 8,
+    paddingHorizontal: 16,
+    borderRadius: 6,
+    alignItems: 'center',
+  },
+  modeButtonActive: {
+    backgroundColor: '#2563eb',
+  },
+  modeButtonText: {
+    fontSize: 14,
+    fontFamily: 'Montserrat-SemiBold',
+    color: '#64748b',
+  },
+  modeButtonTextActive: {
+    color: '#fff',
+  },
+  inviteHelpText: {
+    fontSize: 12,
+    fontFamily: 'Montserrat-Regular',
+    marginTop: 8,
+    textAlign: 'center',
+  },
   inviteInput: {
-    backgroundColor: '#0f172a',
     borderRadius: 8,
     paddingVertical: 12,
     paddingHorizontal: 16,
-    color: '#fff',
     fontSize: 16,
   },
   inviteButton: {
@@ -857,6 +1108,19 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     color: '#fff',
     marginBottom: 16,
+  },
+  joinRequestsButton: {
+    backgroundColor: '#2563eb',
+    paddingVertical: 14,
+    paddingHorizontal: 20,
+    borderRadius: 12,
+    alignItems: 'center',
+    marginBottom: 24,
+  },
+  joinRequestsButtonText: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: '600',
   },
   sliderContainer: {
     marginBottom: 24,
@@ -959,5 +1223,108 @@ const styles = StyleSheet.create({
     color: '#fff',
     fontSize: 14,
     fontWeight: '600',
+  },
+  dangerSection: {
+    borderWidth: 2,
+    borderColor: '#ef4444',
+    borderRadius: 12,
+    marginTop: 24,
+    padding: 16,
+  },
+  deleteButton: {
+    backgroundColor: '#ef4444',
+    borderRadius: 12,
+    paddingVertical: 14,
+    alignItems: 'center',
+    marginBottom: 12,
+  },
+  deleteButtonText: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  dangerHelpText: {
+    fontSize: 12,
+    color: '#94a3b8',
+    textAlign: 'center',
+  },
+  // Delete Modal Styles
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0, 0, 0, 0.8)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 20,
+  },
+  deleteModalContent: {
+    backgroundColor: '#1e293b',
+    borderRadius: 16,
+    padding: 24,
+    width: '100%',
+    maxWidth: 400,
+    borderWidth: 2,
+    borderColor: '#ef4444',
+  },
+  deleteModalTitle: {
+    fontSize: 24,
+    fontWeight: '700',
+    color: '#ef4444',
+    marginBottom: 16,
+    textAlign: 'center',
+  },
+  deleteModalText: {
+    fontSize: 15,
+    color: '#cbd5e1',
+    marginBottom: 12,
+    lineHeight: 22,
+  },
+  deleteKeyword: {
+    fontWeight: '700',
+    color: '#ef4444',
+    fontFamily: 'monospace',
+  },
+  deleteInput: {
+    backgroundColor: '#0f172a',
+    borderRadius: 8,
+    padding: 12,
+    fontSize: 16,
+    color: '#fff',
+    borderWidth: 2,
+    borderColor: '#334155',
+    marginTop: 8,
+    marginBottom: 20,
+    fontFamily: 'monospace',
+  },
+  deleteModalButtons: {
+    flexDirection: 'row',
+    gap: 12,
+  },
+  deleteCancelButton: {
+    flex: 1,
+    backgroundColor: '#334155',
+    borderRadius: 8,
+    paddingVertical: 12,
+    alignItems: 'center',
+  },
+  deleteCancelButtonText: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  deleteConfirmButton: {
+    flex: 1,
+    backgroundColor: '#ef4444',
+    borderRadius: 8,
+    paddingVertical: 12,
+    alignItems: 'center',
+  },
+  deleteConfirmButtonDisabled: {
+    backgroundColor: '#64748b',
+    opacity: 0.5,
+  },
+  deleteConfirmButtonText: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: '700',
   },
 });

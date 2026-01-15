@@ -1,11 +1,27 @@
-import React, { useEffect, useState, useCallback } from 'react';
-import { View, Text, StyleSheet, ScrollView, ActivityIndicator, TouchableOpacity, FlatList, Alert, Image } from 'react-native';
-import { useLocalSearchParams, useRouter, Stack, useFocusEffect } from 'expo-router';
+import React, { useEffect, useState, useCallback, useRef } from 'react';
+import { View, Text, StyleSheet, ScrollView, ActivityIndicator, TouchableOpacity, FlatList, Alert, Image, TextInput, KeyboardAvoidingView, Platform, Modal, RefreshControl, Animated } from 'react-native';
+import Svg, { Path } from 'react-native-svg';
+import * as WebBrowser from 'expo-web-browser';
+import DateTimePicker from '@react-native-community/datetimepicker';
+import { useLocalSearchParams, useRouter, useNavigation, Stack, useFocusEffect } from 'expo-router';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { supabase } from '@/lib/supabase';
 import { useAuth } from '@/contexts/AuthContext';
+import { useTheme } from '@/contexts/ThemeContext';
 import SlidersIcon from '@/components/SlidersIcon';
 import OpenMarketTrading from '@/components/OpenMarketTrading';
 import PlayerTrades from '@/components/PlayerTrades';
+import PlayerProfileModal from '@/components/PlayerProfileModal';
+import LeagueSettingsModal from '@/components/LeagueSettingsModal';
+import SkeletonLoader from '@/components/SkeletonLoader';
+import { getRatingForTimeControl } from '@/utils/ratingHelper';
+
+// Module-level cache that persists across component mounts/unmounts
+const leagueDataCache = new Set<string>();
+const leaderboardCache = new Map<string, { current: LeaderboardEntry[], overall: LeaderboardEntry[] }>();
+const matchupsCache = new Map<string, any[]>();
+const teamsCache = new Map<string, any[]>();
+const leagueDetailsCache = new Map<string, any>();
 
 interface League {
   id: string;
@@ -17,6 +33,7 @@ interface League {
   current_tournament_id: string | null;
   league_type: 'tournament' | 'season';
   season_id: string | null;
+  is_public?: boolean;
 }
 
 interface Tournament {
@@ -27,6 +44,7 @@ interface Tournament {
   location?: string;
   status?: string;
   time_control?: string;
+  round_schedule?: string;
 }
 
 interface Team {
@@ -40,9 +58,14 @@ interface Player {
   fide_id: string;
   name: string;
   rating: number;
+  rapid_rating?: number;
+  blitz_rating?: number;
   country: string;
   title?: string;
   fantasy_score?: number;
+  tournament_id?: string;
+  tournament_name?: string;
+  time_control?: string;
 }
 
 interface TeamRoster {
@@ -55,6 +78,11 @@ interface LeaderboardEntry {
   username: string;
   team_name: string;
   points: number;
+  wins?: number;
+  losses?: number;
+  draws?: number;
+  total_games?: number;
+  classical_points?: number;
 }
 
 interface Matchup {
@@ -69,1049 +97,44 @@ interface Matchup {
   black_fantasy_points?: number;
 }
 
-type TabType = 'teams' | 'leaderboard' | 'matchups';
-
-export default function LeagueDetailScreen() {
-  const { id } = useLocalSearchParams();
-  const router = useRouter();
-  const { user } = useAuth();
-  const [league, setLeague] = useState<League | null>(null);
-  const [tournament, setTournament] = useState<Tournament | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [activeTab, setActiveTab] = useState<TabType>('matchups');
-  
-  // Teams tab data
-  const [teams, setTeams] = useState<Team[]>([]);
-  const [teamRosters, setTeamRosters] = useState<Record<string, Player[]>>({});
-  const [expandedTeams, setExpandedTeams] = useState<Set<string>>(new Set());
-  const [userTeamId, setUserTeamId] = useState<string | null>(null);
-  const [userRoster, setUserRoster] = useState<Player[]>([]);
-  
-  // Leaderboard tab data
-  const [currentLeaderboard, setCurrentLeaderboard] = useState<LeaderboardEntry[]>([]);
-  const [overallLeaderboard, setOverallLeaderboard] = useState<LeaderboardEntry[]>([]);
-  
-  // Matchups tab data
-  const [matchups, setMatchups] = useState<any[]>([]);
-  const [userPlayerIds, setUserPlayerIds] = useState<string[]>([]);
-  const [currentRound, setCurrentRound] = useState(1);
-  const [isOwner, setIsOwner] = useState(false);
-  const [startingDraft, setStartingDraft] = useState(false);
-  const [tournamentPlayerCount, setTournamentPlayerCount] = useState<number>(0);
-  const [warningDismissed, setWarningDismissed] = useState(false);
-
-  useEffect(() => {
-    fetchLeagueDetails();
-  }, [id]);
-
-  useEffect(() => {
-    if (league) {
-      // Always fetch teams for member count display
-      fetchTeams();
-      
-      // Fetch tab-specific data
-      if (activeTab === 'leaderboard') {
-        fetchLeaderboards();
-      } else if (activeTab === 'matchups') {
-        fetchMatchups();
-      }
-    }
-  }, [league, activeTab, currentRound]);
-
-  // Refetch teams when screen comes into focus (e.g., after editing team name)
-  useFocusEffect(
-    useCallback(() => {
-      if (league) {
-        fetchTeams();
-      }
-    }, [league])
-  );
-
-  const fetchLeagueDetails = async () => {
-    try {
-      const { data: leagueData, error: leagueError } = await supabase
-        .from('leagues')
-        .select('*')
-        .eq('id', id)
-        .single();
-
-      if (leagueError) throw leagueError;
-      setLeague(leagueData);
-      setIsOwner(leagueData.owner_id === user?.id);
-
-      // Fetch current tournament with full details
-      let tournamentId = leagueData.current_tournament_id;
-      
-      // For tournament leagues, verify current tournament is still active
-      if (leagueData.league_type === 'tournament') {
-        let needsNewTournament = !tournamentId;
-        
-        // If we have a tournament ID, check if it's still active
-        if (tournamentId) {
-          const { data: currentTournament } = await supabase
-            .from('tournaments')
-            .select('is_active')
-            .eq('id', tournamentId)
-            .single();
-          
-          // If tournament is no longer active, we need a new one
-          if (!currentTournament?.is_active) {
-            needsNewTournament = true;
-            tournamentId = null;
-          }
-        }
-        
-        // Find a new active tournament if needed
-        if (needsNewTournament) {
-          const { data: activeTournaments } = await supabase
-            .from('tournaments')
-            .select('id')
-            .eq('is_active', true)
-            .order('start_date', { ascending: false })
-            .limit(1);
-          
-          if (activeTournaments && activeTournaments.length > 0) {
-            tournamentId = activeTournaments[0].id;
-            // Update the league with this tournament
-            await supabase
-              .from('leagues')
-              .update({ current_tournament_id: tournamentId })
-              .eq('id', leagueData.id);
-          } else {
-            // No active tournaments available, clear the current one
-            await supabase
-              .from('leagues')
-              .update({ current_tournament_id: null })
-              .eq('id', leagueData.id);
-          }
-        }
-      }
-      
-      if (tournamentId) {
-        const { data: tournamentData } = await supabase
-          .from('tournaments')
-          .select('id, name, start_date, end_date, location, status, time_control')
-          .eq('id', tournamentId)
-          .single();
-        
-        setTournament(tournamentData);
-
-        // Fetch tournament player count
-        const { count } = await supabase
-          .from('tournament_standings')
-          .select('*', { count: 'exact', head: true })
-          .eq('tournament_id', tournamentId);
-        
-        setTournamentPlayerCount(count || 0);
-      }
-    } catch (error) {
-      console.error('Error fetching league details:', error);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const fetchTeams = async () => {
-    try {
-      const { data: teamsData, error } = await supabase
-        .from('teams')
-        .select(`
-          id,
-          name,
-          user_id
-        `)
-        .eq('league_id', id);
-
-      if (error) throw error;
-
-      // Fetch usernames separately
-      const userIds = teamsData?.map(t => t.user_id) || [];
-      const { data: profilesData } = await supabase
-        .from('profiles')
-        .select('id, username')
-        .in('id', userIds);
-
-      const profilesMap = new Map(profilesData?.map(p => [p.id, p.username]) || []);
-
-      const teamsList = teamsData?.map((item: any) => ({
-        id: item.id,
-        name: item.name,
-        user_id: item.user_id,
-        username: profilesMap.get(item.user_id) || 'Unknown',
-      })) || [];
-
-      setTeams(teamsList);
-      
-      // Find user's team
-      const userTeam = teamsData?.find((item: any) => item.user_id === user?.id);
-      if (userTeam?.id) {
-        setUserTeamId(userTeam.id);
-        // Fetch user's roster for open market trading
-        fetchUserRoster(userTeam.id);
-      }
-    } catch (error) {
-      console.error('Error fetching teams:', error);
-    }
-  };
-  
-  const fetchUserRoster = async (teamId: string) => {
-    try {
-      // For tournament leagues without an active tournament, clear roster
-      if (league?.league_type === 'tournament' && !league?.current_tournament_id) {
-        setUserRoster([]);
-        return;
-      }
-
-      let query = supabase
-        .from('team_players')
-        .select(`
-          player_fide_id,
-          fantasy_score,
-          players(fide_id, name, rating, country, title)
-        `)
-        .eq('team_id', teamId)
-        .eq('league_id', id);
-
-      // Filter by tournament for tournament leagues
-      if (league?.league_type === 'tournament' && league?.current_tournament_id) {
-        query = query.eq('tournament_id', league.current_tournament_id);
-      }
-
-      const { data: teamPlayers, error } = await query;
-
-      if (error) throw error;
-
-      const players = teamPlayers?.map((tp: any) => ({
-        ...tp.players,
-        fantasy_score: tp.fantasy_score
-      })).filter(Boolean) || [];
-      
-      setUserRoster(players);
-    } catch (error) {
-      console.error('Error fetching user roster:', error);
-    }
-  };
-
-  const fetchTeamRoster = async (teamId: string) => {
-    // Toggle expansion state
-    const newExpanded = new Set(expandedTeams);
-    if (newExpanded.has(teamId)) {
-      newExpanded.delete(teamId);
-      setExpandedTeams(newExpanded);
-      return;
-    }
-
-    // If roster already loaded, just expand it
-    if (teamRosters[teamId]) {
-      newExpanded.add(teamId);
-      setExpandedTeams(newExpanded);
-      return;
-    }
-
-    // Don't try to fetch if team_id is null (user hasn't joined/drafted yet)
-    if (!teamId || teamId === 'null') {
-      setTeamRosters(prev => ({ ...prev, [teamId]: [] }));
-      newExpanded.add(teamId);
-      setExpandedTeams(newExpanded);
-      return;
-    }
-
-    try {
-      // For tournament leagues without an active tournament, show empty roster
-      if (league?.league_type === 'tournament' && !league?.current_tournament_id) {
-        setTeamRosters(prev => ({ ...prev, [teamId]: [] }));
-        newExpanded.add(teamId);
-        setExpandedTeams(newExpanded);
-        return;
-      }
-
-      let query = supabase
-        .from('team_players')
-        .select(`
-          player_fide_id,
-          fantasy_score,
-          players(fide_id, name, rating, country, title)
-        `)
-        .eq('team_id', teamId)
-        .eq('league_id', id);
-
-      // Filter by tournament for tournament leagues
-      if (league?.league_type === 'tournament' && league?.current_tournament_id) {
-        query = query.eq('tournament_id', league.current_tournament_id);
-      }
-
-      const { data: teamPlayers, error } = await query;
-
-      if (error) throw error;
-
-      const players = teamPlayers?.map((tp: any) => ({
-        ...tp.players,
-        fantasy_score: tp.fantasy_score
-      })).filter(Boolean) || [];
-      setTeamRosters(prev => ({ ...prev, [teamId]: players }));
-      newExpanded.add(teamId);
-      setExpandedTeams(newExpanded);
-    } catch (error) {
-      console.error('Error fetching team roster:', error);
-    }
-  };
-
-  const fetchLeaderboards = async () => {
-    try {
-      // Fetch league members
-      const { data: membersData } = await supabase
-        .from('league_memberships')
-        .select(`
-          user_id,
-          team_id,
-          profile:profiles!user_id(username)
-        `)
-        .eq('league_id', id);
-
-      if (!membersData) return;
-
-      const currentScores: LeaderboardEntry[] = [];
-      
-      // CURRENT LEADERBOARD
-      // For tournament leagues: current tournament only
-      // For season leagues: all time in the season
-      for (const member of membersData) {
-        // Skip if no team_id yet
-        if (!member.team_id) {
-          currentScores.push({
-            user_id: member.user_id,
-            username: (member as any).profile?.username || 'Unknown',
-            team_name: `${(member as any).profile?.username || 'Unknown'}'s Team`,
-            points: 0,
-          });
-          continue;
-        }
-
-        // Get team's cumulative total points and name
-        // This includes all points earned, regardless of current roster
-        const { data: teamData } = await supabase
-          .from('teams')
-          .select('total_points, name')
-          .eq('id', member.team_id)
-          .single();
-
-        const totalPoints = teamData?.total_points || 0;
-
-        currentScores.push({
-          user_id: member.user_id,
-          username: (member as any).profile?.username || 'Unknown',
-          team_name: teamData?.name || `${(member as any).profile?.username || 'Unknown'}'s Team`,
-          points: totalPoints,
-        });
-      }
-
-      currentScores.sort((a, b) => b.points - a.points);
-      setCurrentLeaderboard(currentScores);
-
-      // OVERALL LEADERBOARD
-      // For tournament leagues: sum of all finalized tournament scores
-      // For season leagues: same as current (since it's cumulative)
-      const overallScores: Record<string, LeaderboardEntry> = {};
-
-      if (league?.league_type === 'tournament') {
-        // Tournament league: fetch from tournament_scores (finalized tournaments)
-        for (const member of membersData) {
-          const { data: tournamentScores } = await supabase
-            .from('tournament_scores')
-            .select('total_points')
-            .eq('league_id', id)
-            .eq('user_id', member.user_id);
-
-          const totalPoints = tournamentScores?.reduce((sum, ts) => sum + (ts.total_points || 0), 0) || 0;
-
-          // Get team name
-          let teamName = `${(member as any).profile?.username || 'Unknown'}'s Team`;
-          if (member.team_id) {
-            const { data: teamData } = await supabase
-              .from('teams')
-              .select('name')
-              .eq('id', member.team_id)
-              .single();
-            teamName = teamData?.name || teamName;
-          }
-
-          overallScores[member.user_id] = {
-            user_id: member.user_id,
-            username: (member as any).profile?.username || 'Unknown',
-            team_name: teamName,
-            points: totalPoints,
-          };
-        }
-      } else {
-        // Season league: overall = current (it's already cumulative)
-        currentScores.forEach(score => {
-          overallScores[score.user_id] = { ...score };
-        });
-      }
-
-      const overallList = Object.values(overallScores).sort((a, b) => b.points - a.points);
-      setOverallLeaderboard(overallList);
-
-    } catch (error) {
-      console.error('Error fetching leaderboards:', error);
-    }
-  };
-
-  const fetchMatchups = async () => {
-    if (!user) return;
-
-    try {
-      // Get user's team
-      const { data: membership } = await supabase
-        .from('league_memberships')
-        .select('team_id')
-        .eq('league_id', id)
-        .eq('user_id', user.id)
-        .single();
-
-      if (!membership?.team_id) {
-        setMatchups([]);
-        return;
-      }
-
-      // For tournament leagues without active tournament, clear matchups
-      if (league?.league_type === 'tournament' && !league?.current_tournament_id) {
-        setMatchups([]);
-        return;
-      }
-
-      // Get user's players
-      let playersQuery = supabase
-        .from('team_players')
-        .select('player_fide_id')
-        .eq('team_id', membership.team_id)
-        .eq('league_id', id);
-
-      // Filter by tournament for tournament leagues
-      if (league?.league_type === 'tournament' && league?.current_tournament_id) {
-        playersQuery = playersQuery.eq('tournament_id', league.current_tournament_id);
-      }
-
-      const { data: teamPlayers } = await playersQuery;
-
-      const playerIds = teamPlayers?.map(p => p.player_fide_id) || [];
-      setUserPlayerIds(playerIds);
-
-      if (playerIds.length === 0) {
-        setMatchups([]);
-        return;
-      }
-
-      // Get matchups for user's players from tournament_pairings
-      let matchupsQuery = supabase
-        .from('tournament_pairings')
-        .select(`
-          id,
-          round_number,
-          result,
-          white_player_fide_id,
-          black_player_fide_id,
-          white_player:players!tournament_pairings_white_player_fide_id_fkey(fide_id, name, rating, country, title),
-          black_player:players!tournament_pairings_black_player_fide_id_fkey(fide_id, name, rating, country, title)
-        `)
-        .eq('round_number', currentRound)
-        .or(`white_player_fide_id.in.(${playerIds.join(',')}),black_player_fide_id.in.(${playerIds.join(',')})`)
-        .order('round_number');
-
-      // Filter by tournament for tournament leagues
-      if (league?.league_type === 'tournament' && league?.current_tournament_id) {
-        matchupsQuery = matchupsQuery.eq('tournament_id', league.current_tournament_id);
-      }
-
-      const { data: matchupsData } = await matchupsQuery;
-
-      // Fetch fantasy points for these games
-      const gameIds = matchupsData?.map((m: any) => m.id) || [];
-      let fantasyPointsMap: Record<string, { white: number; black: number }> = {};
-
-      if (gameIds.length > 0) {
-        const { data: pointsData } = await supabase
-          .from('game_fantasy_points')
-          .select('game_id, player_fide_id, total_points')
-          .eq('league_id', id)
-          .in('game_id', gameIds);
-
-        // Build map of game_id -> {white_points, black_points}
-        pointsData?.forEach((p: any) => {
-          if (!fantasyPointsMap[p.game_id]) {
-            fantasyPointsMap[p.game_id] = { white: 0, black: 0 };
-          }
-          // Find which player this is using fide_id fields
-          const matchup = matchupsData?.find((m: any) => m.id === p.game_id);
-          if (matchup) {
-            if (matchup.white_player_fide_id === p.player_fide_id) {
-              fantasyPointsMap[p.game_id].white = p.total_points;
-            } else if (matchup.black_player_fide_id === p.player_fide_id) {
-              fantasyPointsMap[p.game_id].black = p.total_points;
-            }
-          }
-        });
-      }
-
-      // Map to old format for compatibility
-      // Note: Supabase returns foreign key relations as arrays, so we take the first element
-      const formattedMatchups = matchupsData?.map((m: any) => ({
-        id: m.id,
-        round_number: m.round_number,
-        white_player: Array.isArray(m.white_player) ? m.white_player[0] : m.white_player,
-        black_player: Array.isArray(m.black_player) ? m.black_player[0] : m.black_player,
-        status: m.result || 'scheduled',
-        white_classical_score: m.result === 'white_win' ? 1 : m.result === 'draw' ? 0.5 : 0,
-        black_classical_score: m.result === 'black_win' ? 1 : m.result === 'draw' ? 0.5 : 0,
-        white_fantasy_points: fantasyPointsMap[m.id]?.white,
-        black_fantasy_points: fantasyPointsMap[m.id]?.black,
-      })) || [];
-
-      setMatchups(formattedMatchups as any);
-    } catch (error) {
-      console.error('Error fetching matchups:', error);
-    }
-  };
-
-  const startDraft = async () => {
-    if (!league || !user) return;
-
-    try {
-      setStartingDraft(true);
-
-      // 1. Update league status to 'drafting'
-      const { error: statusError } = await supabase
-        .from('leagues')
-        .update({ status: 'drafting' })
-        .eq('id', league.id);
-
-      if (statusError) throw statusError;
-
-      // 2. Get all league members
-      const { data: memberships, error: membersError } = await supabase
-        .from('league_memberships')
-        .select('id, user_id, team_id')
-        .eq('league_id', league.id);
-
-      if (membersError) throw membersError;
-
-      // 3. Randomize draft order
-      const shuffled = [...(memberships || [])].sort(() => Math.random() - 0.5);
-      
-      // 4. Update each membership with draft_order
-      for (let i = 0; i < shuffled.length; i++) {
-        const { error: orderError } = await supabase
-          .from('league_memberships')
-          .update({ draft_order: i + 1 })
-          .eq('id', shuffled[i].id);
-
-        if (orderError) throw orderError;
-      }
-
-      // 5. Create draft_state
-      const firstTeamId = shuffled[0]?.team_id;
-      const { error: draftStateError } = await supabase
-        .from('draft_state')
-        .insert({
-          league_id: league.id,
-          current_pick_number: 1,
-          current_team_id: firstTeamId,
-          pick_deadline: new Date(Date.now() + 30000).toISOString(),
-          is_active: true
-        });
-
-      if (draftStateError) throw draftStateError;
-
-      // 6. Update local state and navigate to draft room
-      setLeague(prev => prev ? { ...prev, status: 'drafting' } : null);
-      router.push(`/draft-room/${id}`);
-      
-    } catch (error) {
-      console.error('Error starting draft:', error);
-      Alert.alert('Error', 'Failed to start draft');
-    } finally {
-      setStartingDraft(false);
-    }
-  };
-
-  const renderTeamsTab = () => (
-    <ScrollView style={styles.tabContent}>
-      {teams.length === 0 ? (
-        <Text style={styles.emptyText}>No teams yet</Text>
-      ) : (
-        teams.map((team) => (
-          <View key={team.id} style={styles.teamCard}>
-            <TouchableOpacity
-              onPress={() => fetchTeamRoster(team.id)}
-              style={styles.teamHeader}
-            >
-              <View style={styles.teamHeaderLeft}>
-                <Image
-                  source={require('@/assets/images/fantasy pawns/14.png')}
-                  style={styles.teamAvatar}
-                  tintColor="#2563eb"
-                />
-                <Text style={styles.teamName}>{team.name}</Text>
-              </View>
-              <Text style={styles.expandIcon}>
-                {expandedTeams.has(team.id) ? '▼' : '▶'}
-              </Text>
-            </TouchableOpacity>
-
-            {expandedTeams.has(team.id) && teamRosters[team.id] && (
-              <View style={styles.rosterContainer}>
-                {teamRosters[team.id].length === 0 ? (
-                  <Text style={styles.emptyRosterText}>No players drafted yet</Text>
-                ) : (
-                  teamRosters[team.id].map((player) => (
-                    <View key={player.fide_id} style={styles.playerRow}>
-                      <View style={styles.playerInfo}>
-                        <Text style={styles.playerName}>
-                          {player.title && <Text style={styles.playerTitle}>{player.title} </Text>}
-                          {player.name}
-                        </Text>
-                        <Text style={styles.playerDetails}>
-                          {player.country} • {player.rating}
-                        </Text>
-                      </View>
-                    </View>
-                  ))
-                )}
-              </View>
-            )}
-          </View>
-        ))
-      )}
-      
-      {/* Player Trades - Only show if user has a team AND league is active (draft complete) */}
-      {userTeamId && user && league?.status === 'active' && (
-        <View style={styles.tradesSection}>
-          <PlayerTrades
-            leagueId={id as string}
-            teamId={userTeamId}
-            userId={user.id}
-            currentRoster={userRoster}
-            allTeams={teams}
-            onTradeComplete={() => {
-              fetchTeams(); // Refresh all teams
-              if (userTeamId) fetchUserRoster(userTeamId); // Refresh user's roster
-            }}
-          />
-        </View>
-      )}
-      
-      {/* Open Market Trading - Only show if user has a team AND league is active (draft complete) */}
-      {userTeamId && league?.status === 'active' && (
-        <View style={styles.openMarketSection}>
-          <OpenMarketTrading
-            leagueId={id as string}
-            teamId={userTeamId}
-            currentRoster={userRoster}
-            onTradeComplete={() => {
-              fetchTeams(); // Refresh all teams
-              if (userTeamId) fetchUserRoster(userTeamId); // Refresh user's roster
-            }}
-          />
-        </View>
-      )}
-    </ScrollView>
-  );
-
-  const renderLeaderboardTab = () => (
-    <ScrollView style={styles.tabContent}>
-      {league?.league_type === 'season' ? (
-        // Season League: Single leaderboard
-        <View style={styles.leaderboardSection}>
-          <Text style={styles.leaderboardTitle}>Season Standings</Text>
-          {currentLeaderboard.length === 0 ? (
-            <Text style={styles.emptyText}>No scores yet</Text>
-          ) : (
-            currentLeaderboard.map((entry, index) => (
-              <View key={entry.user_id} style={styles.leaderboardRow}>
-                <View style={styles.rankBadge}>
-                  <Text style={styles.rankText}>#{index + 1}</Text>
-                </View>
-                <Image
-                  source={require('@/assets/images/fantasy pawns/13.png')}
-                  style={styles.leaderboardAvatar}
-                  tintColor={index === 0 ? '#fbbf24' : index === 1 ? '#94a3b8' : index === 2 ? '#cd7f32' : '#64748b'}
-                />
-                <View style={styles.leaderboardInfo}>
-                  <Text style={styles.leaderboardName}>{entry.team_name}</Text>
-                </View>
-                <Text style={styles.leaderboardPoints}>{entry.points} pts</Text>
-              </View>
-            ))
-          )}
-        </View>
-      ) : (
-        // Tournament League: Two leaderboards
-        <>
-          {/* Current Tournament */}
-          <View style={styles.leaderboardSection}>
-            <Text style={styles.leaderboardTitle}>Current Tournament</Text>
-            {currentLeaderboard.length === 0 ? (
-              <Text style={styles.emptyText}>No scores yet</Text>
-            ) : (
-              currentLeaderboard.map((entry, index) => (
-                <View key={entry.user_id} style={styles.leaderboardRow}>
-                  <View style={styles.rankBadge}>
-                    <Text style={styles.rankText}>#{index + 1}</Text>
-                  </View>
-                  <Image
-                    source={require('@/assets/images/fantasy pawns/13.png')}
-                    style={styles.leaderboardAvatar}
-                    tintColor={index === 0 ? '#fbbf24' : index === 1 ? '#94a3b8' : index === 2 ? '#cd7f32' : '#64748b'}
-                  />
-                  <View style={styles.leaderboardInfo}>
-                    <Text style={styles.leaderboardName}>{entry.team_name}</Text>
-                  </View>
-                  <Text style={styles.leaderboardPoints}>{entry.points} pts</Text>
-                </View>
-              ))
-            )}
-          </View>
-
-          {/* Overall Standings */}
-          <View style={styles.leaderboardSection}>
-            <Text style={styles.leaderboardTitle}>Overall Season</Text>
-            {overallLeaderboard.length === 0 ? (
-              <Text style={styles.emptyText}>No overall scores yet</Text>
-            ) : (
-              overallLeaderboard.map((entry, index) => (
-                <View key={entry.user_id} style={styles.leaderboardRow}>
-                  <View style={styles.rankBadge}>
-                    <Text style={styles.rankText}>#{index + 1}</Text>
-                  </View>
-                  <Image
-                    source={require('@/assets/images/fantasy pawns/13.png')}
-                    style={styles.leaderboardAvatar}
-                    tintColor={index === 0 ? '#fbbf24' : index === 1 ? '#94a3b8' : index === 2 ? '#cd7f32' : '#64748b'}
-                  />
-                  <View style={styles.leaderboardInfo}>
-                    <Text style={styles.leaderboardName}>{entry.team_name}</Text>
-                  </View>
-                  <Text style={styles.leaderboardPoints}>{entry.points} pts</Text>
-                </View>
-              ))
-            )}
-          </View>
-        </>
-      )}
-    </ScrollView>
-  );
-
-  const getTournamentStatus = () => {
-    if (!tournament?.start_date) return 'upcoming';
-    const now = new Date();
-    const startDate = new Date(tournament.start_date);
-    return now >= startDate ? 'ongoing' : 'upcoming';
-  };
-
-  const renderMatchupsTab = () => {
-    const tournamentStatus = getTournamentStatus();
-    
-    return (
-      <View style={styles.tabContent}>
-        {/* Tournament Info Banner - Only on Matchups Tab */}
-        {league?.current_tournament_id && tournament && (
-          <View style={styles.upcomingTournamentBox}>
-            <View style={styles.upcomingTournamentHeader}>
-              <Text style={styles.upcomingTournamentIcon}>
-                {tournamentStatus === 'upcoming' ? '📅' : '🏆'}
-              </Text>
-              <Text style={styles.upcomingTournamentTitle}>
-                {tournamentStatus === 'upcoming' ? 'Upcoming Tournament' : 'Ongoing Tournament'}
-              </Text>
-            </View>
-            <Text style={styles.upcomingTournamentName}>{tournament.name}</Text>
-            {tournament.location && (
-              <Text style={styles.upcomingTournamentLocation}>📍 {tournament.location}</Text>
-            )}
-            <View style={styles.upcomingTournamentDivider} />
-            <View style={styles.upcomingTournamentDraftInfo}>
-              <Text style={styles.upcomingTournamentLabel}>
-                {tournamentStatus === 'upcoming' ? 'Tournament Starts:' : 'Started:'}
-              </Text>
-              <Text style={styles.upcomingTournamentDate}>
-                {tournament.start_date
-                  ? new Date(tournament.start_date).toLocaleDateString('en-US', { 
-                      month: 'long', 
-                      day: 'numeric', 
-                      year: 'numeric',
-                      hour: 'numeric',
-                      minute: '2-digit'
-                    })
-                  : 'Date TBD'}
-              </Text>
-            </View>
-            {tournamentStatus === 'upcoming' && (
-              <Text style={styles.upcomingTournamentNote}>
-                Make sure to complete your draft before the tournament begins!
-              </Text>
-            )}
-          </View>
-        )}
-
-        {/* Round Selector */}
-        <View style={styles.roundSelector}>
-        <TouchableOpacity
-          onPress={() => setCurrentRound(Math.max(1, currentRound - 1))}
-          disabled={currentRound === 1}
-          style={[styles.roundButton, currentRound === 1 && styles.roundButtonDisabled]}
-        >
-          <Text style={styles.roundButtonText}>←</Text>
-        </TouchableOpacity>
-        <Text style={styles.roundText}>Round {currentRound}</Text>
-        <TouchableOpacity
-          onPress={() => setCurrentRound(Math.min(7, currentRound + 1))}
-          disabled={currentRound === 7}
-          style={[styles.roundButton, currentRound === 7 && styles.roundButtonDisabled]}
-        >
-          <Text style={styles.roundButtonText}>→</Text>
-        </TouchableOpacity>
-      </View>
-
-      {matchups.length === 0 ? (
-        <Text style={styles.emptyText}>No matchups for your players in this round</Text>
-      ) : (
-        matchups.map((matchup) => {
-          const isWhiteMyPlayer = userPlayerIds.includes((matchup.white_player as any)?.fide_id);
-          const isBlackMyPlayer = userPlayerIds.includes((matchup.black_player as any)?.fide_id);
-          return (
-          <View key={matchup.id} style={styles.matchupCard}>
-            <View style={styles.matchupRow}>
-              <View style={[styles.playerSide, isWhiteMyPlayer && styles.myPlayerSide]}>
-                <View style={styles.playerNameRow}>
-                  <Text style={styles.matchupPlayerName}>
-                    {(matchup.white_player as any)?.title && (
-                      <Text style={styles.playerTitle}>{(matchup.white_player as any).title} </Text>
-                    )}
-                    {(matchup.white_player as any)?.name || 'TBD'}
-                  </Text>
-                  {matchup.white_fantasy_points !== undefined && (
-                    <Text style={[
-                      styles.fantasyPoints,
-                      matchup.white_fantasy_points > 0 ? styles.positivePoints : styles.negativePoints
-                    ]}>
-                      {matchup.white_fantasy_points > 0 ? '+' : ''}{matchup.white_fantasy_points.toFixed(1)}
-                    </Text>
-                  )}
-                </View>
-                <Text style={styles.matchupPlayerInfo}>
-                  {(matchup.white_player as any)?.country} • {(matchup.white_player as any)?.rating}
-                </Text>
-              </View>
-              <View style={styles.matchupScore}>
-                <Text style={styles.scoreText}>
-                  {matchup.white_classical_score} - {matchup.black_classical_score}
-                </Text>
-                <Text style={styles.statusText}>{matchup.status}</Text>
-              </View>
-              <View style={[styles.playerSide, isBlackMyPlayer && styles.myPlayerSide]}>
-                <View style={styles.playerNameRow}>
-                  <Text style={styles.matchupPlayerName}>
-                    {(matchup.black_player as any)?.title && (
-                      <Text style={styles.playerTitle}>{(matchup.black_player as any).title} </Text>
-                    )}
-                    {(matchup.black_player as any)?.name || 'TBD'}
-                  </Text>
-                  {matchup.black_fantasy_points !== undefined && (
-                    <Text style={[
-                      styles.fantasyPoints,
-                      matchup.black_fantasy_points > 0 ? styles.positivePoints : styles.negativePoints
-                    ]}>
-                      {matchup.black_fantasy_points > 0 ? '+' : ''}{matchup.black_fantasy_points.toFixed(1)}
-                    </Text>
-                  )}
-                </View>
-                <Text style={styles.matchupPlayerInfo}>
-                  {(matchup.black_player as any)?.country} • {(matchup.black_player as any)?.rating}
-                </Text>
-              </View>
-            </View>
-          </View>
-        );
-        })
-      )}
-    </View>
-    );
-  };
-
-  if (loading) {
-  return (
-    <View style={styles.loadingContainer}>
-      <ActivityIndicator size="large" color="#2563eb" />
-    </View>
-  );
+interface ChatMessage {
+  id: string;
+  league_id: string;
+  user_id: string;
+  message: string;
+  created_at: string;
+  username?: string;
 }
 
-if (!league) {
-  return (
-    <View style={styles.loadingContainer}>
-      <Text style={styles.errorText}>League not found</Text>
-    </View>
-  );
-}
+type TabType = 'teams' | 'leaderboard' | 'matchups' | 'drafts';
 
-return (
-  <>
-    <Stack.Screen options={{ headerShown: false }} />
-    <View style={styles.container}>
-      {/* Header */}
-      <View style={styles.header}>
-        <View style={styles.headerTop}>
-          <TouchableOpacity onPress={() => router.back()} style={styles.backButton}>
-            <Text style={styles.backButtonText}>←</Text>
-          </TouchableOpacity>
-          <View style={styles.headerCenter}>
-            <Text style={styles.leagueName}>{league.name}</Text>
-            {tournament && (
-              <Text style={styles.tournamentName}>📍 {tournament.name}</Text>
-            )}
-          </View>
-          <TouchableOpacity
-            onPress={() => router.push(`/league-settings/${id}`)}
-            style={styles.settingsButton}
-          >
-            <SlidersIcon size={24} color="#94a3b8" />
-          </TouchableOpacity>
-        </View>
-      </View>
+// Helper function to get start of week (Monday)
+const getStartOfWeek = (date: Date): Date => {
+  const d = new Date(date);
+  const day = d.getDay();
+  const diff = d.getDate() - day + (day === 0 ? -6 : 1); // Adjust when day is Sunday
+  return new Date(d.setDate(diff));
+};
 
-      {/* Tabs */}
-      <View style={styles.tabBar}>
-        <TouchableOpacity
-          style={[styles.tab, activeTab === 'matchups' && styles.activeTab]}
-          onPress={() => setActiveTab('matchups')}
-        >
-          <Text style={[styles.tabText, activeTab === 'matchups' && styles.activeTabText]}>
-            Matchups
-          </Text>
-        </TouchableOpacity>
-        <TouchableOpacity
-          style={[styles.tab, activeTab === 'leaderboard' && styles.activeTab]}
-          onPress={() => setActiveTab('leaderboard')}
-        >
-          <Text style={[styles.tabText, activeTab === 'leaderboard' && styles.activeTabText]}>
-            Leaderboard
-          </Text>
-        </TouchableOpacity>
-        <TouchableOpacity
-          style={[styles.tab, activeTab === 'teams' && styles.activeTab]}
-          onPress={() => setActiveTab('teams')}
-        >
-          <Text style={[styles.tabText, activeTab === 'teams' && styles.activeTabText]}>
-            Teams
-          </Text>
-        </TouchableOpacity>
-      </View>
-
-      {/* Tab Content */}
-      <ScrollView style={styles.content}>
-        {activeTab === 'matchups' && renderMatchupsTab()}
-        {activeTab === 'leaderboard' && renderLeaderboardTab()}
-        {activeTab === 'teams' && renderTeamsTab()}
-        
-        {/* Member Capacity Notification - Show when not at max capacity */}
-        {isOwner && league.status === 'open' && teams.length < league.max_members && (
-          <View style={styles.capacityNotification}>
-            <Text style={styles.capacityTitle}>👥 Waiting for Members</Text>
-            <Text style={styles.capacityText}>
-              {teams.length} of {league.max_members} members have joined. You need all {league.max_members} members to start the draft.
-            </Text>
-            <Text style={styles.capacityHint}>
-              💡 Tip: You can change the max members in league settings if you want to start sooner.
-            </Text>
-          </View>
-        )}
-
-        {/* High Picks Warning - Show when total picks > tournament players */}
-        {!warningDismissed && isOwner && league.status === 'open' && league.league_type === 'tournament' && tournamentPlayerCount > 0 && (
-          (() => {
-            const totalPicks = league.picks_per_person * league.max_members;
-            const picksPerPersonRatio = league.picks_per_person / tournamentPlayerCount;
-            
-            // Warn if total picks exceeds available players OR picks per person ratio > 1:5
-            if (totalPicks > tournamentPlayerCount || picksPerPersonRatio > 0.2) {
-              return (
-                <View style={styles.warningNotification}>
-                  <View style={styles.warningHeader}>
-                    <Text style={styles.warningTitle}>⚠️ Draft Configuration Warning</Text>
-                    <TouchableOpacity 
-                      onPress={() => setWarningDismissed(true)}
-                      style={styles.closeButton}
-                    >
-                      <Text style={styles.closeButtonText}>✕</Text>
-                    </TouchableOpacity>
-                  </View>
-                  {totalPicks > tournamentPlayerCount ? (
-                    <>
-                      <Text style={styles.warningText}>
-                        Total picks needed: {league.max_members} members × {league.picks_per_person} picks = {totalPicks} picks
-                      </Text>
-                      <Text style={styles.warningText}>
-                        Available players: {tournamentPlayerCount}
-                      </Text>
-                      <Text style={styles.warningText}>
-                        ⚠️ Not enough players! Members may be forced to pick fewer than {league.picks_per_person} players, or some members may not be able to draft at all.
-                      </Text>
-                    </>
-                  ) : (
-                    <>
-                      <Text style={styles.warningText}>
-                        Picks per person ({league.picks_per_person}) is high relative to tournament size ({tournamentPlayerCount} players).
-                      </Text>
-                      <Text style={styles.warningText}>
-                        This may cause teammates to face each other. Consider reducing picks per person in settings.
-                      </Text>
-                    </>
-                  )}
-                </View>
-              );
-            }
-            return null;
-          })()
-        )}
-
-        {/* Start Draft Button - Only show for owner when league is open and all spots filled */}
-        {isOwner && league.status === 'open' && teams.length === league.max_members && (
-          <View style={styles.startDraftContainer}>
-            {league.league_type === 'tournament' && !league.current_tournament_id ? (
-              <>
-                <Text style={styles.startDraftTitle}>📅 No Active Tournament</Text>
-                <Text style={styles.startDraftText}>
-                  No tournaments right now. Check back soon for the next tournament announcement!
-                </Text>
-              </>
-            ) : (
-              <>
-                <Text style={styles.startDraftTitle}>🎯 Ready to Draft!</Text>
-                <Text style={styles.startDraftText}>
-                  All {league.max_members} members have joined. Start the draft to begin picking players!
-                </Text>
-                <TouchableOpacity
-                  style={[styles.startDraftButton, startingDraft && styles.startDraftButtonDisabled]}
-                  onPress={startDraft}
-                  disabled={startingDraft}
-                >
-                  {startingDraft ? (
-                    <ActivityIndicator color="#fff" />
-                  ) : (
-                    <Text style={styles.startDraftButtonText}>Start Draft</Text>
-                  )}
-                </TouchableOpacity>
-              </>
-            )}
-          </View>
-        )}
-      </ScrollView>
-      </View>
-    </>
-  );
-}
+// Helper function to format date for display
+const formatDateHeader = (dateStr: string): string => {
+  const date = new Date(dateStr);
+  const today = new Date();
+  const yesterday = new Date(today);
+  yesterday.setDate(yesterday.getDate() - 1);
+  
+  if (date.toDateString() === today.toDateString()) {
+    return 'Today';
+  } else if (date.toDateString() === yesterday.toDateString()) {
+    return 'Yesterday';
+  } else {
+    return date.toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' });
+  }
+};
 
 const styles = StyleSheet.create({
+
+  
   container: {
     flex: 1,
     backgroundColor: '#0f172a',
@@ -1125,7 +148,7 @@ const styles = StyleSheet.create({
   header: {
     paddingHorizontal: 16,
     paddingTop: 60,
-    paddingBottom: 16,
+    paddingBottom: 8,
     backgroundColor: '#0f172a',
     borderBottomWidth: 1,
     borderBottomColor: '#334155',
@@ -1151,6 +174,17 @@ const styles = StyleSheet.create({
   settingsButton: {
     padding: 8,
   },
+  joinButton: {
+    backgroundColor: '#2563eb',
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    borderRadius: 8,
+  },
+  joinButtonText: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: '600',
+  },
   settingsIcon: {
     fontSize: 24,
   },
@@ -1158,46 +192,73 @@ const styles = StyleSheet.create({
     fontSize: 20,
     fontWeight: 'bold',
     color: '#fff',
-    marginBottom: 2,
+    marginBottom: 0,
   },
   tournamentName: {
     fontSize: 11,
     color: '#94a3b8',
   },
+  activeTournamentsScroll: {
+    marginTop: 4,
+    maxHeight: 32,
+    marginBottom: 0,
+  },
+  activeTournamentBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 12,
+    marginRight: 8,
+  },
+  activeTournamentPin: {
+    fontSize: 12,
+    marginRight: 4,
+  },
+  activeTournamentText: {
+    fontSize: 11,
+    fontWeight: '600',
+  },
   tabBar: {
     flexDirection: 'row',
-    backgroundColor: '#1e293b',
-    borderBottomWidth: 1,
-    borderBottomColor: '#334155',
+    backgroundColor: '#0f172a',
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    gap: 8,
   },
   tab: {
     flex: 1,
-    paddingVertical: 16,
+    paddingVertical: 10,
+    paddingHorizontal: 8,
     alignItems: 'center',
-    borderBottomWidth: 2,
-    borderBottomColor: 'transparent',
+    borderRadius: 20,
+    borderWidth: 2,
+    borderColor: 'transparent',
+    backgroundColor: '#1e293b',
   },
   activeTab: {
-    borderBottomColor: '#2563eb',
+    borderColor: '#2563eb',
+    backgroundColor: '#1e293b',
   },
   tabText: {
-    fontSize: 16,
+    fontSize: 12,
     color: '#94a3b8',
     fontWeight: '600',
   },
   activeTabText: {
-    color: '#2563eb',
+    color: '#fff',
   },
   content: {
     flex: 1,
   },
   tabContent: {
-    padding: 16,
+    paddingHorizontal: 16,
+    paddingVertical: 0,
   },
   teamCard: {
     backgroundColor: '#1e293b',
     borderRadius: 12,
-    marginBottom: 12,
+    marginBottom: 8,
     overflow: 'hidden',
   },
   teamHeader: {
@@ -1235,6 +296,24 @@ const styles = StyleSheet.create({
     padding: 16,
     paddingTop: 12,
   },
+  tournamentSectionHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 8,
+    paddingTop: 12,
+    borderTopWidth: 1,
+    borderTopColor: '#334155',
+    marginTop: 8,
+  },
+  tournamentSectionIcon: {
+    fontSize: 16,
+    marginRight: 8,
+  },
+  tournamentSectionTitle: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#60a5fa',
+  },
   playerRow: {
     flexDirection: 'row',
     justifyContent: 'space-between',
@@ -1265,12 +344,20 @@ const styles = StyleSheet.create({
   },
   leaderboardSection: {
     marginBottom: 32,
+    paddingHorizontal: 16,
   },
   leaderboardTitle: {
     fontSize: 20,
     fontWeight: 'bold',
     color: '#fff',
     marginBottom: 16,
+  },
+  sectionHeader: {
+    fontSize: 20,
+    fontWeight: '700',
+    color: '#fff',
+    marginBottom: 20,
+    letterSpacing: 0.5,
   },
   leaderboardRow: {
     flexDirection: 'row',
@@ -1312,10 +399,18 @@ const styles = StyleSheet.create({
     fontSize: 12,
     color: '#94a3b8',
   },
+  leaderboardPointsContainer: {
+    alignItems: 'flex-end',
+  },
   leaderboardPoints: {
     fontSize: 18,
     fontWeight: 'bold',
     color: '#60a5fa',
+  },
+  classicalPoints: {
+    fontSize: 12,
+    color: '#94a3b8',
+    marginTop: 2,
   },
   roundSelector: {
     flexDirection: 'row',
@@ -1343,7 +438,25 @@ const styles = StyleSheet.create({
   roundText: {
     fontSize: 18,
     fontWeight: 'bold',
-    color: '#fff',
+  },
+  roundDateTime: {
+    fontSize: 11,
+    marginTop: 4,
+  },
+  matchupHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    marginBottom: 8,
+    gap: 12,
+  },
+  matchupHeaderText: {
+    flex: 1,
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#94a3b8',
+    textAlign: 'center',
   },
   matchupCard: {
     backgroundColor: '#1e293b',
@@ -1366,10 +479,29 @@ const styles = StyleSheet.create({
     padding: 8,
     backgroundColor: 'rgba(59, 130, 246, 0.1)',
   },
+  opponentPlayerSide: {
+    borderRadius: 8,
+    padding: 8,
+    backgroundColor: 'rgba(239, 68, 68, 0.08)',
+    position: 'relative',
+  },
+  teamNameCorner: {
+    fontSize: 9,
+    fontWeight: '600',
+    color: '#ef4444',
+    backgroundColor: 'rgba(239, 68, 68, 0.15)',
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 4,
+    overflow: 'hidden',
+    marginTop: 4,
+    alignSelf: 'flex-start',
+  },
   matchupPlayerName: {
     fontSize: 14,
     fontWeight: '600',
     color: '#fff',
+    flexShrink: 1,
     marginBottom: 4,
   },
   matchupPlayerInfo: {
@@ -1395,7 +527,8 @@ const styles = StyleSheet.create({
     fontSize: 16,
     color: '#64748b',
     textAlign: 'center',
-    marginTop: 40,
+    marginTop: 8,
+    paddingBottom: 40,
   },
   errorText: {
     fontSize: 18,
@@ -1423,21 +556,6 @@ const styles = StyleSheet.create({
     color: '#94a3b8',
     textAlign: 'center',
     marginBottom: 12,
-  },
-  startDraftButton: {
-    backgroundColor: '#10b981',
-    borderRadius: 6,
-    paddingVertical: 10,
-    paddingHorizontal: 24,
-    alignItems: 'center',
-  },
-  startDraftButtonDisabled: {
-    opacity: 0.6,
-  },
-  startDraftButtonText: {
-    color: '#fff',
-    fontSize: 16,
-    fontWeight: 'bold',
   },
   upcomingTournamentBox: {
     margin: 16,
@@ -1499,29 +617,81 @@ const styles = StyleSheet.create({
     fontStyle: 'italic',
     marginTop: 4,
   },
+  upcomingTournamentCard: {
+    backgroundColor: '#1e293b',
+    borderWidth: 1,
+    borderColor: '#3b82f6',
+    borderRadius: 8,
+    padding: 12,
+    marginHorizontal: 16,
+    marginBottom: 8,
+  },
+  tournamentCardWide: {
+    backgroundColor: '#1e293b',
+    borderWidth: 1,
+    borderColor: '#3b82f6',
+    borderRadius: 12,
+    padding: 16,
+    marginBottom: 8,
+  },
+  sectionTitle: {
+    fontSize: 18,
+    fontWeight: '600',
+  },
+  upcomingTournamentCardHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 8,
+  },
+  upcomingTournamentCardIcon: {
+    width: 32,
+    height: 32,
+    marginRight: 12,
+  },
+  upcomingTournamentCardTitle: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#fff',
+    marginBottom: 2,
+  },
+  upcomingTournamentCardLocation: {
+    fontSize: 12,
+    color: '#94a3b8',
+  },
+  upcomingTournamentCardDate: {
+    fontSize: 13,
+    fontWeight: '500',
+    color: '#60a5fa',
+  },
+  daysUntilBadge: {
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 12,
+    backgroundColor: '#3b82f6',
+  },
+  daysUntilText: {
+    fontSize: 11,
+    fontWeight: '600',
+    color: '#fff',
+  },
   capacityNotification: {
-    backgroundColor: '#1e3a5f',
     borderRadius: 12,
     padding: 16,
     margin: 16,
     borderWidth: 1,
-    borderColor: '#3b82f6',
   },
   capacityTitle: {
     fontSize: 18,
     fontWeight: 'bold',
-    color: '#fff',
     marginBottom: 8,
   },
   capacityText: {
     fontSize: 14,
-    color: '#cbd5e1',
     marginBottom: 8,
     lineHeight: 20,
   },
   capacityHint: {
     fontSize: 12,
-    color: '#93c5fd',
     fontStyle: 'italic',
   },
   warningNotification: {
@@ -1560,17 +730,37 @@ const styles = StyleSheet.create({
     lineHeight: 20,
   },
   playerNameRow: {
+    flexDirection: 'column',
+    alignItems: 'flex-start',
+    gap: 4,
+  },
+  playerHeaderRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 8,
+    gap: 6,
+    marginBottom: 4,
+  },
+  colorBadge: {
+    width: 20,
+    height: 20,
+    borderRadius: 10,
+    backgroundColor: '#e5e7eb',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  blackBadge: {
+    backgroundColor: '#1f2937',
+  },
+  colorBadgeText: {
+    fontSize: 10,
+    fontWeight: '700',
+    color: '#000',
   },
   fantasyPoints: {
-    fontSize: 12,
-    fontWeight: 'bold',
-    paddingHorizontal: 6,
-    paddingVertical: 2,
-    borderRadius: 4,
-    backgroundColor: '#1e293b',
+    fontSize: 13,
+    fontWeight: '700',
+    alignSelf: 'flex-start',
+    marginTop: 4,
   },
   positivePoints: {
     color: '#10b981',
@@ -1579,15 +769,5188 @@ const styles = StyleSheet.create({
     color: '#ef4444',
   },
   tradesSection: {
-    marginTop: 24,
+    marginTop: 8,
     borderTopWidth: 2,
     borderTopColor: '#334155',
-    paddingTop: 16,
+    paddingTop: 8,
+    marginLeft: -16,
+    marginRight: -16,
+    paddingLeft: 0,
+    paddingRight: 0,
   },
   openMarketSection: {
-    marginTop: 24,
+    marginTop: 8,
     borderTopWidth: 2,
     borderTopColor: '#334155',
+    paddingTop: 8,
+    marginLeft: -16,
+    marginRight: -16,
+    paddingLeft: 0,
+    paddingRight: 0,
+  },
+  inviteSection: {
+    marginTop: 24,
+    padding: 16,
+    borderRadius: 12,
+    borderWidth: 1,
+  },
+  inviteSectionTitle: {
+    fontSize: 16,
+    fontWeight: '600',
+    marginBottom: 12,
+  },
+  inviteModeToggle: {
+    flexDirection: 'row',
+    borderRadius: 8,
+    padding: 4,
+    marginBottom: 16,
+  },
+  modeButton: {
+    flex: 1,
+    paddingVertical: 8,
+    paddingHorizontal: 16,
+    borderRadius: 6,
+    alignItems: 'center',
+  },
+  modeButtonText: {
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  inviteInput: {
+    borderWidth: 1,
+    borderRadius: 8,
+    padding: 12,
+    fontSize: 16,
+    marginBottom: 12,
+  },
+  inviteButton: {
+    paddingVertical: 12,
+    paddingHorizontal: 24,
+    borderRadius: 8,
+    alignItems: 'center',
+    marginBottom: 8,
+  },
+  inviteButtonText: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  inviteHelpText: {
+    fontSize: 13,
+    fontStyle: 'italic',
+    marginTop: 4,
+  },
+  joinRequestsButton: {
+    paddingVertical: 12,
+    paddingHorizontal: 20,
+    borderRadius: 8,
+    alignItems: 'center',
+    marginBottom: 16,
+  },
+  joinRequestsButtonText: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  tournamentSelector: {
+    marginBottom: 8,
+    paddingTop: 0,
+    paddingLeft: 16,
+    paddingRight: 0,
+    borderRadius: 12,
+    overflow: 'visible',
+  },
+  ongoingLabel: {
+    fontSize: 12,
+    fontWeight: '600',
+    marginBottom: 8,
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+    paddingLeft: 0,
+  },
+  selectorLabel: {
+    fontSize: 14,
+    fontWeight: 'bold',
+    marginBottom: 8,
+    paddingBottom: 4,
+  },
+  tournamentChip: {
+    borderRadius: 20,
+    paddingVertical: 8,
+    paddingHorizontal: 16,
+    marginRight: 8,
+    borderWidth: 1,
+    maxWidth: 280,
+  },
+  tournamentChipActive: {
+    backgroundColor: '#2563eb',
+    borderColor: '#2563eb',
+  },
+  tournamentChipText: {
+    fontSize: 14,
+  },
+  tournamentChipTextActive: {
+    color: '#fff',
+    fontWeight: '600',
+  },
+  tournamentSelectorButton: {
+    borderRadius: 20,
+    paddingVertical: 8,
+    paddingHorizontal: 16,
+    marginRight: 8,
+    borderWidth: 1,
+    maxWidth: 280,
+  },
+  tournamentSelectorText: {
+    fontSize: 14,
+  },
+  tournamentChipDate: {
+    fontSize: 11,
+    color: '#64748b',
+    marginTop: 2,
+  },
+  tournamentChipDateActive: {
+    color: '#bfdbfe',
+  },
+  tournamentChipUpcoming: {
+    borderColor: '#f59e0b',
+    borderWidth: 1.5,
+  },
+  tournamentChipPlayersLabel: {
+    fontSize: 10,
+    color: '#64748b',
+    fontWeight: '600',
+    marginBottom: 2,
+  },
+  tournamentChipPlayers: {
+    fontSize: 11,
+    color: '#64748b',
+    lineHeight: 14,
+    flexWrap: 'wrap',
+  },
+  tournamentChipPlayersActive: {
+    color: '#bfdbfe',
+  },
+  weekToggle: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 16,
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    borderRadius: 12,
+  },
+  weekSelector: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 16,
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    borderRadius: 12,
+  },
+  weekButton: {
+    backgroundColor: '#2563eb',
+    borderRadius: 8,
+    paddingVertical: 8,
+    paddingHorizontal: 16,
+  },
+  weekButtonText: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  weekText: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#fff',
+  },
+  dateHeader: {
+    fontSize: 16,
+    fontWeight: 'bold',
+    color: '#60a5fa',
+    marginTop: 16,
+    marginBottom: 8,
+  },
+  chatContainer: {
+    flex: 1,
+    padding: 16,
+  },
+  messageContainer: {
+    marginBottom: 12,
+    padding: 12,
+    borderRadius: 12,
+    maxWidth: '80%',
+  },
+  ownMessage: {
+    alignSelf: 'flex-end',
+    backgroundColor: '#2563eb',
+  },
+  otherMessage: {
+    alignSelf: 'flex-start',
+    backgroundColor: '#1e293b',
+  },
+  messageUsername: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#94a3b8',
+    marginBottom: 4,
+  },
+  messageText: {
+    fontSize: 15,
+    color: '#fff',
+    lineHeight: 20,
+  },
+  messageTime: {
+    fontSize: 10,
+    color: '#94a3b8',
+    marginTop: 4,
+    alignSelf: 'flex-end',
+  },
+  chatInputContainer: {
+    flexDirection: 'row',
+    padding: 16,
+    backgroundColor: '#1e293b',
+    borderTopWidth: 1,
+    borderTopColor: '#334155',
+    alignItems: 'flex-end',
+  },
+  readOnlyNotice: {
+    padding: 16,
+    backgroundColor: '#1e293b',
+    borderTopWidth: 1,
+    borderTopColor: '#334155',
+    alignItems: 'center',
+  },
+  readOnlyText: {
+    fontSize: 14,
+    color: '#94a3b8',
+    fontStyle: 'italic',
+  },
+  chatInput: {
+    flex: 1,
+    backgroundColor: '#0f172a',
+    borderRadius: 20,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    color: '#fff',
+    fontSize: 15,
+    maxHeight: 100,
+    marginRight: 8,
+  },
+  sendButton: {
+    backgroundColor: '#2563eb',
+    borderRadius: 20,
+    width: 40,
+    height: 40,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  sendButtonDisabled: {
+    backgroundColor: '#334155',
+    opacity: 0.5,
+  },
+  sendButtonText: {
+    fontSize: 20,
+    color: '#fff',
+  },
+  floatingChatButton: {
+    position: 'absolute',
+    bottom: 40,
+    right: 24,
+    width: 56,
+    height: 56,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  floatingChatIcon: {
+    fontSize: 32,
+  },
+  unreadBadge: {
+    position: 'absolute',
+    top: 0,
+    right: 0,
+    backgroundColor: '#ef4444',
+    borderRadius: 10,
+    minWidth: 18,
+    height: 18,
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingHorizontal: 4,
+  },
+  unreadBadgeText: {
+    color: '#fff',
+    fontSize: 10,
+    fontWeight: 'bold',
+  },
+  chatModalHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    padding: 16,
+    paddingTop: 60,
+    paddingBottom: 20,
+    backgroundColor: '#1e293b',
+    borderBottomWidth: 1,
+    borderBottomColor: '#334155',
+  },
+  chatModalClose: {
+    fontSize: 28,
+    color: '#94a3b8',
+    width: 44,
+    minWidth: 44,
+  },
+  chatModalTitle: {
+    fontSize: 20,
+    fontWeight: 'bold',
+    color: '#fff',
+    flex: 1,
+    textAlign: 'center',
+  },
+  muteButton: {
+    padding: 8,
+    width: 44,
+    minWidth: 44,
+    alignItems: 'center',
+  },
+  muteButtonText: {
+    fontSize: 24,
+  },
+  // Modal Overlay (shared)
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0, 0, 0, 0.8)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  // Tournament Report Modal Styles
+  reportModalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0, 0, 0, 0.8)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 20,
+  },
+  reportModalContainer: {
+    backgroundColor: '#1e293b',
+    borderRadius: 16,
+    width: '100%',
+    maxWidth: 500,
+    maxHeight: '80%',
+  },
+  reportModalHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    padding: 20,
+    borderBottomWidth: 1,
+    borderBottomColor: '#334155',
+  },
+  reportModalTitle: {
+    fontSize: 24,
+    fontWeight: 'bold',
+    color: '#fff',
+  },
+  reportCloseButton: {
+    padding: 8,
+  },
+  reportCloseButtonText: {
+    fontSize: 24,
+    color: '#94a3b8',
+  },
+  reportModalContent: {
+    padding: 20,
+  },
+  reportSubtitle: {
+    fontSize: 18,
+    fontWeight: '600',
+    color: '#fff',
+    marginBottom: 16,
+  },
+  standingRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#0f172a',
+    padding: 16,
+    borderRadius: 12,
+    marginBottom: 8,
+  },
+  standingRowHighlight: {
+    backgroundColor: '#1e3a8a',
+    borderWidth: 2,
+    borderColor: '#3b82f6',
+  },
+  standingRank: {
+    width: 50,
+    alignItems: 'center',
+  },
+  rankEmoji: {
+    fontSize: 28,
+  },
+  rankNumber: {
+    fontSize: 18,
+    fontWeight: '600',
+    color: '#94a3b8',
+  },
+  standingInfo: {
+    flex: 1,
+    marginLeft: 12,
+  },
+  standingUsername: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#fff',
+    marginBottom: 4,
+  },
+  standingStats: {
+    fontSize: 14,
+    color: '#94a3b8',
+  },
+  standingPoints: {
+    fontSize: 20,
+    fontWeight: 'bold',
+    color: '#10b981',
+  },
+  reportFooter: {
+    marginTop: 24,
+    padding: 16,
+    backgroundColor: '#0f172a',
+    borderRadius: 12,
+  },
+  reportFooterText: {
+    fontSize: 14,
+    color: '#94a3b8',
+    textAlign: 'center',
+  },
+  reportDismissButton: {
+    backgroundColor: '#3b82f6',
+    padding: 16,
+    borderRadius: 12,
+    margin: 20,
+    alignItems: 'center',
+  },
+  reportDismissButtonText: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#fff',
+  },
+  welcomeModalContainer: {
+    backgroundColor: '#1e293b',
+    borderRadius: 20,
+    padding: 32,
+    margin: 20,
+    alignItems: 'center',
+    maxWidth: 400,
+  },
+  welcomeModalIcon: {
+    fontSize: 48,
+    marginBottom: 16,
+  },
+  welcomeModalTitle: {
+    fontSize: 24,
+    fontWeight: '700',
+    color: '#fff',
+    textAlign: 'center',
+    marginBottom: 12,
+  },
+  welcomeModalMessage: {
+    fontSize: 16,
+    color: '#94a3b8',
+    textAlign: 'center',
+    marginBottom: 24,
+    lineHeight: 24,
+  },
+  welcomeModalButton: {
+    backgroundColor: '#3b82f6',
+    paddingHorizontal: 32,
+    paddingVertical: 12,
+    borderRadius: 12,
+  },
+  welcomeModalButtonText: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#fff',
+  },
+  welcomeBanner: {
+    backgroundColor: '#1e40af',
+    borderRadius: 12,
+    padding: 16,
+    margin: 16,
+    marginTop: 0,
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  welcomeBannerIcon: {
+    fontSize: 32,
+    marginRight: 12,
+  },
+  welcomeBannerTextContainer: {
+    flex: 1,
+  },
+  welcomeBannerTitle: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: '#fff',
+    marginBottom: 4,
+  },
+  welcomeBannerMessage: {
+    fontSize: 14,
+    color: '#bfdbfe',
+    lineHeight: 20,
+  },
+  seasonDraftInfo: {
+    backgroundColor: '#1e293b',
+    borderRadius: 12,
+    padding: 20,
+    margin: 16,
+    marginTop: 8,
+  },
+  seasonDraftInfoText: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#fff',
+    marginBottom: 8,
+    textAlign: 'center',
+  },
+  seasonDraftInfoSubtext: {
+    fontSize: 14,
+    color: '#94a3b8',
+    textAlign: 'center',
+    lineHeight: 20,
+  },
+  draftButtonContent: {
+    alignItems: 'center',
+    width: '100%',
+  },
+  startDraftButton: {
+    backgroundColor: '#3b82f6',
+    padding: 16,
+    borderRadius: 12,
+    alignItems: 'center',
+    marginTop: 12,
+  },
+  startDraftButtonDisabled: {
+    backgroundColor: '#64748b',
+    opacity: 0.6,
+  },
+  startDraftButtonText: {
+    fontSize: 20,
+    fontWeight: 'bold',
+    color: '#fff',
+    textAlign: 'center',
+    marginBottom: 12,
+  },
+  tournamentInfoRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+  },
+  tournamentIconImage: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: '#fff',
+  },
+  tournamentTextContainer: {
+    flex: 1,
+  },
+  tournamentNameInButton: {
+    fontSize: 15,
+    fontWeight: '600',
+    color: '#e2e8f0',
+    marginBottom: 2,
+  },
+  tournamentDateInButton: {
+    fontSize: 13,
+    color: '#94a3b8',
+  },
+  // Drafts Tab Styles
+  draftsSection: {
+    marginTop: 0,
+    marginBottom: 12,
+    paddingHorizontal: 0,
+  },
+  draftsSectionTitle: {
+    fontSize: 18,
+    fontWeight: 'bold',
+    color: '#fff',
+    marginBottom: 4,
+  },
+  draftsSectionSubtitle: {
+    fontSize: 14,
+    color: '#94a3b8',
+  },
+  emptyStateContainer: {
+    padding: 32,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  emptyStateIcon: {
+    fontSize: 48,
+    marginBottom: 16,
+  },
+  emptyStateTitle: {
+    fontSize: 18,
+    fontWeight: '600',
+    marginBottom: 8,
+    textAlign: 'center',
+  },
+  emptyStateText: {
+    fontSize: 14,
+    textAlign: 'center',
+    lineHeight: 20,
+  },
+  tournamentsList: {
+    paddingHorizontal: 16,
+    gap: 12,
+  },
+  tournamentCard: {
+    backgroundColor: '#1e293b',
+    borderRadius: 12,
+    padding: 16,
+    borderWidth: 1,
+    borderColor: '#334155',
+    marginBottom: 12,
+  },
+  tournamentCardHeader: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    marginBottom: 12,
+  },
+  tournamentCardIcon: {
+    width: 48,
+    height: 48,
+    borderRadius: 24,
+    backgroundColor: '#fff',
+    marginRight: 12,
+  },
+  tournamentCardInfo: {
+    flex: 1,
+  },
+  tournamentNameRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 4,
+  },
+  tournamentCardName: {
+    fontSize: 16,
+    fontWeight: '600',
+    flex: 1,
+  },
+  daysAwayText: {
+    fontSize: 11,
+    color: '#60a5fa',
+    marginLeft: 8,
+  },
+  daysAwayTextTop: {
+    fontSize: 11,
+    color: '#60a5fa',
+    marginBottom: 8,
+  },
+  tournamentCardLocation: {
+    fontSize: 14,
+    marginBottom: 2,
+  },
+  tournamentCardDate: {
+    fontSize: 14,
+    color: '#94a3b8',
+    marginBottom: 2,
+  },
+  tournamentCardTimeControl: {
+    fontSize: 14,
+    color: '#94a3b8',
+  },
+  draftButtonRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  draftButton: {
+    backgroundColor: '#3b82f6',
+    padding: 12,
+    borderRadius: 8,
+    alignItems: 'center',
+    flex: 1,
+    marginRight: 12,
+  },
+  draftButtonDisabled: {
+    backgroundColor: '#64748b',
+    opacity: 0.6,
+  },
+  draftButtonText: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#fff',
+  },
+  daysAwayNextToButton: {
+    fontSize: 11,
+    color: '#60a5fa',
+  },
+  draftedTournamentCard: {
+    backgroundColor: 'transparent',
+    borderRadius: 12,
+    padding: 16,
+    borderWidth: 1,
+    borderColor: '#1e3a8a',
+    marginBottom: 12,
+  },
+  draftedInfo: {
+    fontSize: 14,
+    color: '#60a5fa',
+    marginTop: 4,
+  },
+  badgeContainer: {
+    flexDirection: 'row',
+    gap: 8,
+    marginTop: 8,
+    flexWrap: 'wrap',
+  },
+  draftedBadge: {
+    backgroundColor: '#10b981',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 6,
+    alignSelf: 'flex-start',
+  },
+  completedBadge: {
+    backgroundColor: '#6b7280',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 6,
+    alignSelf: 'flex-start',
+  },
+  completedBadgeText: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#fff',
+  },
+  scheduleButton: {
+    backgroundColor: '#1e293b',
+    padding: 12,
+    borderRadius: 8,
+    alignItems: 'center',
+    borderWidth: 2,
+    borderColor: '#3b82f6',
+  },
+  scheduleButtonText: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#3b82f6',
+  },
+  scheduledDraftText: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#3b82f6',
+    marginBottom: 8,
+  },
+  cancelScheduleButton: {
+    padding: 8,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: '#334155',
+    alignItems: 'center',
+    marginTop: 8,
+  },
+  cancelScheduleButtonText: {
+    fontSize: 14,
+    color: '#94a3b8',
+  },
+  draftedBadgeText: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#fff',
+  },
+  seasonIconContainer: {
+    width: 48,
+    height: 48,
+    borderRadius: 24,
+    backgroundColor: '#3b82f6',
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginRight: 12,
+  },
+  seasonIcon: {
+    fontSize: 24,
+  },
+  tournamentCardDescription: {
+    fontSize: 14,
+    color: '#94a3b8',
+    marginTop: 4,
+    lineHeight: 20,
+  },
+  memberCapacityNotification: {
+    backgroundColor: '#1e293b',
+    borderRadius: 12,
+    padding: 16,
+    margin: 16,
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+  },
+  memberCapacityIcon: {
+    fontSize: 32,
+    marginRight: 12,
+  },
+  memberCapacityTextContainer: {
+    flex: 1,
+  },
+  memberCapacityTitle: {
+    fontSize: 16,
+    fontWeight: '600',
+    marginBottom: 4,
+  },
+  memberCapacityText: {
+    fontSize: 14,
+    lineHeight: 20,
+  },
+  seasonTitleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 4,
+  },
+  infoButton: {
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginLeft: 8,
+  },
+  infoButtonText: {
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  openingText: {
+    fontSize: 12,
+    flex: 1,
+    marginRight: 8,
+  },
+  moveCountText: {
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  scheduleModalContainer: {
+    backgroundColor: '#fff',
+    borderRadius: 16,
+    padding: 24,
+    width: '90%',
+    maxWidth: 400,
+  },
+  scheduleModalTitle: {
+    fontSize: 20,
+    fontWeight: 'bold',
+    marginBottom: 20,
+    textAlign: 'center',
+  },
+  dateTimeButton: {
+    borderWidth: 1,
+    borderRadius: 8,
+    padding: 16,
+    marginBottom: 16,
+  },
+  dateTimeButtonLabel: {
+    fontSize: 12,
+    marginBottom: 4,
+  },
+  dateTimeButtonValue: {
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  scheduleModalButtons: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginTop: 8,
+    gap: 12,
+  },
+  scheduleModalButton: {
+    flex: 1,
+    paddingVertical: 12,
+    paddingHorizontal: 20,
+    borderRadius: 8,
+    alignItems: 'center',
+  },
+  cancelButton: {
+    borderWidth: 1,
+  },
+  cancelButtonText: {
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  confirmButton: {
+    backgroundColor: '#2563eb',
+  },
+  confirmButtonText: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  tournamentWarningBanner: {
+    flexDirection: 'row',
+    padding: 16,
+    margin: 16,
+    marginTop: 8,
+    borderRadius: 12,
+    borderWidth: 2,
+    gap: 12,
+  },
+  tournamentWarningIcon: {
+    fontSize: 24,
+  },
+  tournamentWarningContent: {
+    flex: 1,
+  },
+  tournamentWarningTitle: {
+    fontSize: 16,
+    fontWeight: 'bold',
+    marginBottom: 4,
+  },
+  tournamentWarningText: {
+    fontSize: 14,
+    lineHeight: 20,
+  },
+  roundScheduleContainer: {
+    borderRadius: 12,
+    borderWidth: 1,
+    padding: 16,
+    marginHorizontal: 16,
+    marginBottom: 16,
+  },
+  roundScheduleTitle: {
+    fontSize: 18,
+    fontWeight: 'bold',
+    marginBottom: 12,
+  },
+  roundScheduleRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingVertical: 12,
+    borderBottomWidth: 1,
+  },
+  roundScheduleName: {
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  roundScheduleDate: {
+    fontSize: 14,
+    fontWeight: '500',
+  },
+  scrollIndicator: {
+    marginTop: 24,
+    marginBottom: 8,
     paddingTop: 16,
+    borderTopWidth: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 16,
+  },
+  scrollIndicatorText: {
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  scrollIndicatorArrow: {
+    fontSize: 20,
+    opacity: 0.6,
   },
 });
+
+export default function LeagueDetailScreen() {
+  const { id, from, tab } = useLocalSearchParams();
+  const router = useRouter();
+  const navigation = useNavigation();
+  const { user, profile } = useAuth();
+  const { colors } = useTheme();
+  const [league, setLeague] = useState<League | null>(null);
+  const [tournament, setTournament] = useState<Tournament | null>(null);
+  const [loading, setLoading] = useState(true);
+  const slideAnim = useRef(new Animated.Value(0)).current; // Start in position
+  const fadeAnim = useRef(new Animated.Value(1)).current; // Start visible
+  const hasAnimated = useRef(false); // Track if we've animated
+  
+  // Multi-tournament support
+  const [draftableTournaments, setDraftableTournaments] = useState<any[]>([]);
+  const [leagueTournaments, setLeagueTournaments] = useState<any[]>([]);
+  const [activeTournaments, setActiveTournaments] = useState<any[]>([]);
+  const [activeTab, setActiveTab] = useState<TabType>((tab as TabType) || 'matchups');
+  const [showDraftsTab, setShowDraftsTab] = useState(false);
+  
+  // Teams tab data
+  const [teams, setTeams] = useState<Team[]>([]);
+  const [teamRosters, setTeamRosters] = useState<Record<string, Player[]>>({});
+  const [expandedTeams, setExpandedTeams] = useState<Set<string>>(new Set());
+  const [tournamentSectionCollapsed, setTournamentSectionCollapsed] = useState(true);
+  const [userTeamId, setUserTeamId] = useState<string | null>(null);
+  const [userRoster, setUserRoster] = useState<Player[]>([]);
+  const [currentTournamentTimeControl, setCurrentTournamentTimeControl] = useState<string | null>(null);
+  const [hasAnyDraftedPlayers, setHasAnyDraftedPlayers] = useState(false);
+  
+  // Leaderboard tab data
+  const [currentLeaderboard, setCurrentLeaderboard] = useState<LeaderboardEntry[]>([]);
+  const [overallLeaderboard, setOverallLeaderboard] = useState<LeaderboardEntry[]>([]);
+  const [leaderboardLoading, setLeaderboardLoading] = useState(false);
+  const [animatedScores, setAnimatedScores] = useState<{[key: string]: number}>({});
+  const [isAnimating, setIsAnimating] = useState(false);
+  const [selectedLeaderboardTournamentId, setSelectedLeaderboardTournamentId] = useState<string | null>(null); // null = overall season
+  const leaderboardFetchedRef = useRef(false);
+  const matchupsFetchedRef = useRef(false);
+  const [matchupsLoading, setMatchupsLoading] = useState(false);
+  const teamsFetchedRef = useRef(false);
+  const initialDataFetchedRef = useRef<string | null>(null); // Track league ID to prevent refetch
+  
+  // Matchups tab data
+  const [matchups, setMatchups] = useState<any[]>([]);
+  const [userPlayerIds, setUserPlayerIds] = useState<string[]>([]);
+  const [currentRound, setCurrentRound] = useState(1);
+  const [maxRound, setMaxRound] = useState(1);
+  const [selectedMatchupTournamentId, setSelectedMatchupTournamentId] = useState<string | null>(null);
+  const [isOwner, setIsOwner] = useState(false);
+  const [startingDraft, setStartingDraft] = useState(false);
+  
+  // Team ownership cache - persists across round changes
+  const [teamOwnershipCache, setTeamOwnershipCache] = useState<Record<string, string>>({});
+  
+  // Season league state
+  const [availableTournaments, setAvailableTournaments] = useState<Tournament[]>([]);
+  const [selectedTournamentId, setSelectedTournamentId] = useState<string | null>(null);
+  const [weekStartDate, setWeekStartDate] = useState<Date>(getStartOfWeek(new Date()));
+  const [gamesByDate, setGamesByDate] = useState<Record<string, any[]>>({});
+
+  // Chat state
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [newMessage, setNewMessage] = useState('');
+  const [sendingMessage, setSendingMessage] = useState(false);
+  const [chatModalVisible, setChatModalVisible] = useState(false);
+  const [chatMuted, setChatMuted] = useState(false);
+  const [togglingMute, setTogglingMute] = useState(false);
+  const [unreadCount, setUnreadCount] = useState(0);
+  const [lastMessageTimestamp, setLastMessageTimestamp] = useState<number>(0);
+  const chatScrollRef = useRef<ScrollView>(null);
+  const chatModalVisibleRef = useRef(chatModalVisible);
+  const lastReadMessageIdRef = useRef<string | null>(null);
+  const [tournamentPlayerCount, setTournamentPlayerCount] = useState<number>(0);
+  const [warningDismissed, setWarningDismissed] = useState(false);
+  const [isMember, setIsMember] = useState(false);
+  const [isPublicLeague, setIsPublicLeague] = useState(false);
+
+  // Tournament report state
+  const [tournamentReport, setTournamentReport] = useState<any>(null);
+  const [reportModalVisible, setReportModalVisible] = useState(false);
+  
+  // Welcome modal for new members
+  const [welcomeModalVisible, setWelcomeModalVisible] = useState(false);
+  
+  // Season info modal
+  const [seasonInfoModalVisible, setSeasonInfoModalVisible] = useState(false);
+  
+  // Settings modal
+  const [settingsModalVisible, setSettingsModalVisible] = useState(false);
+  
+  // Pull to refresh state
+  const [refreshing, setRefreshing] = useState(false);
+  
+  // Log when refreshing state changes
+  useEffect(() => {
+  }, [refreshing]);
+  
+  // Scheduled drafts state
+  const [scheduledDrafts, setScheduledDrafts] = useState<Record<string, any>>({});
+  const [scheduleModalVisible, setScheduleModalVisible] = useState(false);
+  const [schedulingTournamentId, setSchedulingTournamentId] = useState<string | null>(null);
+  const [schedulingTournamentName, setSchedulingTournamentName] = useState<string>('');
+  const [scheduledDate, setScheduledDate] = useState(new Date());
+  const [scheduledTime, setScheduledTime] = useState(new Date());
+  const [showDatePicker, setShowDatePicker] = useState(false);
+  const [showTimePicker, setShowTimePicker] = useState(false);
+  
+  // Player profile modal state
+  const [selectedPlayer, setSelectedPlayer] = useState<any>(null);
+  const [playerModalVisible, setPlayerModalVisible] = useState(false);
+  
+  // Invite functionality for teams tab
+  const [inviteUsername, setInviteUsername] = useState('');
+  const [inviteEmail, setInviteEmail] = useState('');
+  const [inviteMode, setInviteMode] = useState<'username' | 'email'>('username');
+  const [memberCount, setMemberCount] = useState(0);
+
+  const handleOpenLichess = (url: string | undefined) => {
+    if (!url) return;
+    WebBrowser.openBrowserAsync(url);
+  };
+
+  const handlePlayerClick = async (fideId: string, playerData: any) => {
+    try {
+      const { data, error } = await supabase
+        .from('players')
+        .select('fide_id, name, title, rating, rapid_rating, blitz_rating, country, profile_picture_url, bio')
+        .eq('fide_id', fideId)
+        .single();
+      if (error) throw error;
+      setSelectedPlayer(data || playerData);
+      setPlayerModalVisible(true);
+    } catch (error) {
+      console.error('Error fetching player details:', error);
+      setSelectedPlayer({ ...playerData, fide_id: fideId });
+      setPlayerModalVisible(true);
+    }
+  };
+
+  useEffect(() => {
+    // Only animate if we've already loaded this league before (cached)
+    const isCached = leagueDetailsCache.has(id as string);
+    
+    if (isCached && !hasAnimated.current) {
+      // Reset animation values for cached loads
+      slideAnim.setValue(300);
+      fadeAnim.setValue(0);
+      
+      // Animate in
+      Animated.parallel([
+        Animated.timing(slideAnim, {
+          toValue: 0,
+          duration: 200,
+          useNativeDriver: true,
+        }),
+        Animated.timing(fadeAnim, {
+          toValue: 1,
+          duration: 200,
+          useNativeDriver: true,
+        })
+      ]).start();
+      
+      hasAnimated.current = true;
+    }
+
+    fetchLeagueDetails();
+    checkMembership();
+    checkForUnviewedReports();
+    fetchScheduledDrafts();
+  }, [id]);
+
+  // Auto-redirect to draft room when league status becomes 'drafting'
+  // Track if we've already redirected to prevent loops
+  const hasRedirectedToDraft = React.useRef(false);
+
+  useEffect(() => {
+    if (league?.status === 'drafting' && isMember && !hasRedirectedToDraft.current) {
+      hasRedirectedToDraft.current = true;
+      router.push(`/draft-room/${id}`);
+    }
+    
+    // Reset the flag if league is no longer drafting
+    if (league?.status !== 'drafting') {
+      hasRedirectedToDraft.current = false;
+    }
+  }, [league?.status, isMember, id]);
+
+  // Force refresh league data when returning from draft room
+  useFocusEffect(
+    useCallback(() => {
+      // When screen comes into focus, check if we need to refresh
+      // This handles the case where user returns from draft room
+      if (id && !loading) {
+        fetchLeagueDetails(true); // Force refresh to get updated status
+        if (activeTab === 'teams') {
+          teamsCache.delete(id as string); // Clear teams cache
+          fetchTeams();
+        }
+      }
+    }, [id, loading, activeTab])
+  );
+
+  // Fetch team ownership and tournament data when league changes
+  useEffect(() => {
+    if (league?.id) {
+      // Always fetch these as they're needed for UI rendering and are lightweight
+      if (league.league_type === 'tournament') {
+        fetchDraftableTournaments();
+      }
+      fetchLeagueTournaments();
+      
+      // Prefetch leaderboards immediately so they're ready when user switches tabs
+      if (!leaderboardFetchedRef.current) {
+        fetchLeaderboards();
+        leaderboardFetchedRef.current = true;
+      }
+      
+      // Only fetch heavy team ownership data once per session
+      if (!leagueDataCache.has(league.id)) {
+        fetchAllTeamOwnership();
+        leagueDataCache.add(league.id);
+      } else {
+      }
+    }
+  }, [league?.id, league?.season_id, league?.league_type]);
+
+  // Fetch tab-specific data when tab or round changes
+  useEffect(() => {
+    if (league?.id) {
+      // Only fetch teams once
+      if (!teamsFetchedRef.current) {
+        fetchTeams();
+        teamsFetchedRef.current = true;
+      } else {
+      }
+      
+      // Fetch tab-specific data
+      if (activeTab === 'leaderboard') {
+        // Only fetch if we haven't fetched yet
+        if (!leaderboardFetchedRef.current) {
+          fetchLeaderboards();
+          leaderboardFetchedRef.current = true;
+        } else {
+        }
+      } else if (activeTab === 'matchups') {
+        // Only fetch matchups if teamOwnershipCache is loaded (for team name display)
+        if (Object.keys(teamOwnershipCache).length > 0) {
+          if (!matchupsFetchedRef.current || league.league_type === 'season') {
+            if (league.league_type === 'season') {
+              fetchSeasonLeagueTournaments();
+            } else {
+              fetchMatchups();
+              matchupsFetchedRef.current = true;
+            }
+          } else {
+          }
+        } else {
+        }
+      }
+    }
+  }, [league?.id, activeTab, currentRound, teamOwnershipCache]);
+
+  // Fetch ALL matchups when league loads and team ownership is ready
+  useEffect(() => {
+    if (league && league.league_type === 'tournament' && Object.keys(teamOwnershipCache).length > 0 && leagueTournaments.length > 0 && !matchupsFetchedRef.current) {
+      fetchAllMatchupsForLeague();
+      matchupsFetchedRef.current = true;
+    }
+  }, [teamOwnershipCache, leagueTournaments]);
+
+  // Display cached matchups when on matchups tab OR fetch if not cached
+  useEffect(() => {
+    if (league && league.league_type === 'tournament' && activeTab === 'matchups' && leagueTournaments.length > 0) {
+      const tournamentId = selectedMatchupTournamentId || leagueTournaments[0]?.tournament_id;
+      const cacheKey = `${league.id}-${tournamentId}-${currentRound}`;
+      const cached = matchupsCache.get(cacheKey);
+      
+      if (cached) {
+        setMatchups(cached);
+      } else if (selectedMatchupTournamentId) {
+        // If switching to a tournament that's not cached, fetch it
+        fetchMatchups();
+      }
+    }
+  }, [activeTab, selectedMatchupTournamentId, currentRound, leagueTournaments]);
+
+  // Fetch season league matchups when tournament or week changes
+  useEffect(() => {
+    if (league && league.league_type === 'season' && selectedTournamentId && activeTab === 'matchups') {
+      fetchSeasonLeagueMatchups();
+    }
+  }, [selectedTournamentId, weekStartDate, activeTab]);
+
+  // Refetch matchups when selected tournament changes (tournament leagues)
+  useEffect(() => {
+    if (league && league.league_type === 'tournament' && selectedMatchupTournamentId && activeTab === 'matchups' && matchupsFetchedRef.current) {
+      // Check if we have cached matchups for this tournament
+      const cacheKey = `${league.id}-${selectedMatchupTournamentId}-${currentRound}`;
+      const cached = matchupsCache.get(cacheKey);
+      
+      if (cached) {
+        setMatchups(cached);
+      } else {
+        fetchMatchups();
+      }
+    }
+  }, [selectedMatchupTournamentId]);
+
+  // Refetch leaderboards when selected tournament changes
+  useEffect(() => {
+    if (league && activeTab === 'leaderboard' && league.league_type === 'tournament' && leaderboardFetchedRef.current) {
+      // Check if we have cached data for this tournament
+      const cacheKey = `${league.id}-${selectedLeaderboardTournamentId || 'overall'}`;
+      const cached = leaderboardCache.get(cacheKey);
+      
+      if (cached) {
+        setCurrentLeaderboard(cached.current);
+        setOverallLeaderboard(cached.overall);
+      } else {
+        fetchLeaderboards();
+      }
+    }
+  }, [selectedLeaderboardTournamentId]);
+
+  const fetchDraftableTournaments = async () => {
+    if (!league?.id) return;
+    
+    try {
+      const { data, error } = await supabase
+        .rpc('get_draftable_tournaments_for_league', { p_league_id: league.id });
+      
+      if (error) {
+        console.error('Error fetching draftable tournaments:', error);
+        return;
+      }
+      
+      setDraftableTournaments(data || []);
+    } catch (error) {
+      console.error('Error fetching draftable tournaments:', error);
+    }
+  };
+
+  const fetchLeagueTournaments = async () => {
+    if (!league?.id) return;
+    
+    try {
+      const { data, error } = await supabase
+        .rpc('get_league_tournaments', { p_league_id: league.id });
+      
+      if (error) {
+        console.error('Error fetching league tournaments:', error);
+        return;
+      }
+      
+      setLeagueTournaments(data || []);
+      
+      // Auto-select first drafted tournament for matchups if none selected
+      if (league?.league_type === 'tournament' && !selectedMatchupTournamentId && data) {
+        const draftedTournaments = data.filter((t: any) => t.player_count > 0);
+        if (draftedTournaments.length > 0) {
+          setSelectedMatchupTournamentId(draftedTournaments[0].tournament_id);
+        }
+      }
+      
+      // Fetch active tournaments for display in header
+      fetchActiveTournaments();
+    } catch (error) {
+      console.error('Error fetching league tournaments:', error);
+    }
+  };
+
+  const fetchActiveTournaments = async () => {
+    if (!league?.id) return;
+    
+    try {
+      // Get league's tournaments first
+      const { data: leagueTourns, error: leagueError } = await supabase
+        .rpc('get_league_tournaments', { p_league_id: league.id });
+      
+      if (leagueError || !leagueTourns || leagueTourns.length === 0) {
+        setActiveTournaments([]);
+        return;
+      }
+      
+      // Get active tournaments from that list
+      const tournamentIds = leagueTourns.map((t: any) => t.tournament_id);
+      
+      const { data, error } = await supabase
+        .from('tournaments')
+        .select('id, name, status')
+        .eq('status', 'active')
+        .in('id', tournamentIds);
+      
+      if (error) {
+        console.error('Error fetching active tournaments:', error);
+        return;
+      }
+      
+      setActiveTournaments(data || []);
+    } catch (error) {
+      console.error('Error fetching active tournaments:', error);
+    }
+  };
+
+  const fetchAllTeamOwnership = async () => {
+    if (!league || !id) return;
+    
+    try {
+      
+      // Fetch from team_players (active)
+      let query = supabase
+        .from('team_players')
+        .select('player_fide_id, teams!inner(name)')
+        .eq('league_id', id);
+      
+      // For season leagues, filter by season_id
+      if (league.league_type === 'season' && league.season_id) {
+        query = query.eq('season_id', league.season_id);
+      }
+      
+      const { data: teamOwnerships, error } = await query;
+      
+      if (error) {
+        console.error('Error fetching all team ownerships:', error);
+        return;
+      }
+      
+      // Also fetch from old_team_players (archived) for completed tournaments
+      let oldQuery = supabase
+        .from('old_team_players')
+        .select('player_fide_id, teams!inner(name)')
+        .eq('league_id', id);
+      
+      if (league.league_type === 'season' && league.season_id) {
+        oldQuery = oldQuery.eq('season_id', league.season_id);
+      }
+      
+      const { data: oldTeamOwnerships } = await oldQuery;
+      
+      // Build complete cache from both active and archived players
+      const cache: Record<string, string> = {};
+      teamOwnerships?.forEach((tp: any) => {
+        const teamData = Array.isArray(tp.teams) ? tp.teams[0] : tp.teams;
+        cache[tp.player_fide_id] = teamData?.name || '';
+      });
+      
+      oldTeamOwnerships?.forEach((tp: any) => {
+        const teamData = Array.isArray(tp.teams) ? tp.teams[0] : tp.teams;
+        // Only add if not already in cache (active players take precedence)
+        if (!cache[tp.player_fide_id]) {
+          cache[tp.player_fide_id] = teamData?.name || '';
+        }
+      });
+      
+      setTeamOwnershipCache(cache);
+    } catch (error) {
+      console.error('Error in fetchAllTeamOwnership:', error);
+    }
+  };
+
+  const checkMembership = async () => {
+    if (!user || !id) return;
+    
+    try {
+      const { data, error } = await supabase
+        .from('league_memberships')
+        .select('id, team_id')
+        .eq('league_id', id)
+        .eq('user_id', user.id)
+        .single();
+
+      setIsMember(!!data);
+      
+      // Show welcome modal if member has no team (new member)
+      if (data && !data.team_id) {
+        const hasSeenWelcome = await AsyncStorage.getItem(`welcome_${id}_${user.id}`);
+        if (!hasSeenWelcome) {
+          setWelcomeModalVisible(true);
+          await AsyncStorage.setItem(`welcome_${id}_${user.id}`, 'true');
+        }
+      }
+    } catch (error) {
+      setIsMember(false);
+    }
+  };
+
+  const fetchLeagueDetails = async (forceRefresh = false) => {
+    try {
+      // Check cache first - if cached, skip loading state entirely (unless force refresh)
+      const cached = leagueDetailsCache.get(id as string);
+      if (cached && !forceRefresh) {
+        setLeague(cached);
+        setIsOwner(cached.owner_id === user?.id);
+        setIsPublicLeague(cached.is_public || false);
+        // Don't show loading screen when using cache
+        if (loading) setLoading(false);
+        return;
+      }
+
+      const { data: leagueData, error: leagueError } = await supabase
+        .from('leagues')
+        .select('*')
+        .eq('id', id)
+        .single();
+
+      if (leagueError) throw leagueError;
+      setLeague(leagueData);
+      setIsOwner(leagueData.owner_id === user?.id);
+      setIsPublicLeague(leagueData.is_public || false);
+      leagueDetailsCache.set(id as string, leagueData);
+
+      // For tournament leagues, we no longer auto-select a tournament
+      // Instead, we rely on leagueTournaments (tournaments with drafts)
+      // The tournament state will be set when user selects a tournament in the UI
+    } catch (error) {
+      console.error('Error fetching league details:', error);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const fetchTeams = async () => {
+    try {
+      // Check cache first
+      const cacheKey = id as string;
+      const cached = teamsCache.get(cacheKey);
+      if (cached) {
+        setTeams(cached);
+        
+        // Fetch member count even when using cache
+        const { count } = await supabase
+          .from('league_memberships')
+          .select('*', { count: 'exact' })
+          .eq('league_id', id);
+        setMemberCount(count || 0);
+        
+        // Still update user team info
+        const userTeam = cached.find((item: any) => item.user_id === user?.id);
+        if (userTeam?.id) {
+          setUserTeamId(userTeam.id);
+          fetchUserRoster(userTeam.id);
+        }
+        await checkIfAnyPlayersDrafted();
+        return;
+      }
+
+      const { data: teamsData, error } = await supabase
+        .from('teams')
+        .select(`
+          id,
+          name,
+          user_id
+        `)
+        .eq('league_id', id);
+
+      if (error) throw error;
+
+      // Fetch usernames separately
+      const userIds = teamsData?.map(t => t.user_id) || [];
+      const { data: profilesData } = await supabase
+        .from('profiles')
+        .select('id, username')
+        .in('id', userIds);
+
+      const profilesMap = new Map(profilesData?.map(p => [p.id, p.username]) || []);
+
+      const teamsList = teamsData?.map((item: any) => ({
+        id: item.id,
+        name: item.name,
+        user_id: item.user_id,
+        username: profilesMap.get(item.user_id) || 'Unknown',
+      })) || [];
+
+      setTeams(teamsList);
+      teamsCache.set(cacheKey, teamsList);
+      
+      // Fetch member count for invite UI
+      const { count } = await supabase
+        .from('league_memberships')
+        .select('*', { count: 'exact' })
+        .eq('league_id', id);
+      
+      setMemberCount(count || 0);
+      
+      // Find user's team
+      const userTeam = teamsData?.find((item: any) => item.user_id === user?.id);
+      if (userTeam?.id) {
+        setUserTeamId(userTeam.id);
+        // Fetch user's roster for open market trading
+        fetchUserRoster(userTeam.id);
+      }
+      
+      // Check if ANY team in the league has drafted players
+      await checkIfAnyPlayersDrafted();
+    } catch (error) {
+      console.error('Error fetching teams:', error);
+    }
+  };
+  
+  const checkIfAnyPlayersDrafted = async () => {
+    try {
+      // Check if any team_players exist for this league
+      const { data, error } = await supabase
+        .from('team_players')
+        .select('id')
+        .eq('league_id', id)
+        .limit(1);
+      
+      if (error) throw error;
+      
+      setHasAnyDraftedPlayers((data?.length || 0) > 0);
+    } catch (error) {
+      console.error('Error checking drafted players:', error);
+      setHasAnyDraftedPlayers(false);
+    }
+  };
+  
+  const fetchUserRoster = async (teamId: string) => {
+    try {
+      // For tournament leagues, fetch all players from all drafted tournaments
+      let query = supabase
+        .from('team_players')
+        .select(`
+          player_fide_id,
+          fantasy_score,
+          tournament_id,
+          season_id,
+          players(fide_id, name, rating, rapid_rating, blitz_rating, country, title)
+        `)
+        .eq('team_id', teamId)
+        .eq('league_id', id);
+
+      // No filtering by current_tournament_id - show all drafted players
+
+      const { data: teamPlayers, error } = await query;
+
+      if (error) throw error;
+
+      const players = teamPlayers?.map((tp: any) => ({
+        ...tp.players,
+        fantasy_score: tp.fantasy_score,
+        tournament_id: tp.tournament_id,
+        season_id: tp.season_id
+      })).filter(Boolean) || [];
+      
+      setUserRoster(players);
+    } catch (error) {
+      console.error('Error fetching user roster:', error);
+    }
+  };
+
+  const fetchTeamRoster = async (teamId: string) => {
+    // Toggle expansion state
+    const newExpanded = new Set(expandedTeams);
+    if (newExpanded.has(teamId)) {
+      newExpanded.delete(teamId);
+      setExpandedTeams(newExpanded);
+      return;
+    }
+
+    // If roster already loaded, just expand it
+    if (teamRosters[teamId]) {
+      newExpanded.add(teamId);
+      setExpandedTeams(newExpanded);
+      return;
+    }
+
+    // Don't try to fetch if team_id is null (user hasn't joined/drafted yet)
+    if (!teamId || teamId === 'null') {
+      setTeamRosters(prev => ({ ...prev, [teamId]: [] }));
+      newExpanded.add(teamId);
+      setExpandedTeams(newExpanded);
+      return;
+    }
+
+    try {
+      // For tournament leagues, fetch all players from all drafted tournaments
+      let query = supabase
+        .from('team_players')
+        .select(`
+          player_fide_id,
+          fantasy_score,
+          tournament_id,
+          players(fide_id, name, rating, rapid_rating, blitz_rating, country, title),
+          tournaments(id, name, time_control)
+        `)
+        .eq('team_id', teamId)
+        .eq('league_id', id);
+
+      // No filtering by current_tournament_id - show all drafted players grouped by tournament
+
+      const { data: teamPlayers, error } = await query;
+
+      if (error) throw error;
+
+      const players = teamPlayers?.map((tp: any) => ({
+        ...tp.players,
+        fantasy_score: tp.fantasy_score,
+        tournament_id: tp.tournament_id,
+        tournament_name: tp.tournaments?.name || 'Unknown Tournament',
+        time_control: tp.tournaments?.time_control
+      })).filter(Boolean) || [];
+      setTeamRosters(prev => ({ ...prev, [teamId]: players }));
+      newExpanded.add(teamId);
+      setExpandedTeams(newExpanded);
+    } catch (error) {
+      console.error('Error fetching team roster:', error);
+    }
+  };
+
+  const fetchLeaderboards = async () => {
+    if (!league || !id) return;
+
+
+    try {
+      // Start animation immediately
+      setIsAnimating(true);
+      
+      // Only show loading spinner if we have no data yet
+      if (currentLeaderboard.length === 0 && overallLeaderboard.length === 0) {
+        setLeaderboardLoading(true);
+      }
+      // Fetch league members
+      const { data: membersData } = await supabase
+        .from('league_memberships')
+        .select(`
+          user_id,
+          team_id,
+          profile:profiles!user_id(username)
+        `)
+        .eq('league_id', id);
+
+      if (!membersData) return;
+
+      const currentScores: LeaderboardEntry[] = [];
+      
+      // CURRENT LEADERBOARD
+      // For tournament leagues: fetch from team_tournament_points
+      // For season leagues: all time in the season
+      
+      if (league?.league_type === 'tournament') {
+        // Tournament league: fetch from team_tournament_points
+        for (const member of membersData) {
+          if (!member.team_id) {
+            currentScores.push({
+              user_id: member.user_id,
+              username: (member as any).profile?.username || 'Unknown',
+              team_name: (member as any).profile?.username || 'Unknown',
+              points: 0,
+            });
+            continue;
+          }
+
+          const { data: teamData } = await supabase
+            .from('teams')
+            .select('name')
+            .eq('id', member.team_id)
+            .single();
+
+          if (selectedLeaderboardTournamentId) {
+            // Specific tournament selected: fetch points for that tournament
+            const { data: tournamentPoints, error: tpError } = await supabase
+              .from('team_tournament_points')
+              .select('points, wins, losses, draws, total_games')
+              .eq('team_id', member.team_id)
+              .eq('tournament_id', selectedLeaderboardTournamentId)
+              .maybeSingle();
+
+            if (tpError) console.error('  Error:', tpError);
+
+            currentScores.push({
+              user_id: member.user_id,
+              username: (member as any).profile?.username || 'Unknown',
+              team_name: teamData?.name || (member as any).profile?.username || 'Unknown',
+              points: tournamentPoints?.points || 0,
+              wins: tournamentPoints?.wins || 0,
+              losses: tournamentPoints?.losses || 0,
+              draws: tournamentPoints?.draws || 0,
+              total_games: tournamentPoints?.total_games || 0,
+            });
+          } else {
+            // No specific tournament: sum all active (non-finalized) tournament points
+            const { data: activeTournamentPoints, error: atpError } = await supabase
+              .from('team_tournament_points')
+              .select('points, wins, losses, draws, total_games')
+              .eq('team_id', member.team_id)
+              .eq('league_id', id)
+              .eq('is_finalized', false);
+
+            if (atpError) console.error('  Error:', atpError);
+
+            const totalActivePoints = activeTournamentPoints?.reduce((sum, ttp) => sum + (ttp.points || 0), 0) || 0;
+            const totalWins = activeTournamentPoints?.reduce((sum, ttp) => sum + (ttp.wins || 0), 0) || 0;
+            const totalLosses = activeTournamentPoints?.reduce((sum, ttp) => sum + (ttp.losses || 0), 0) || 0;
+            const totalDraws = activeTournamentPoints?.reduce((sum, ttp) => sum + (ttp.draws || 0), 0) || 0;
+            const totalGames = activeTournamentPoints?.reduce((sum, ttp) => sum + (ttp.total_games || 0), 0) || 0;
+
+            currentScores.push({
+              user_id: member.user_id,
+              username: (member as any).profile?.username || 'Unknown',
+              team_name: teamData?.name || (member as any).profile?.username || 'Unknown',
+              points: totalActivePoints,
+              wins: totalWins,
+              losses: totalLosses,
+              draws: totalDraws,
+              total_games: totalGames,
+            });
+          }
+        }
+      } else {
+        // Season league: fetch cumulative points
+        for (const member of membersData) {
+          if (!member.team_id) {
+            currentScores.push({
+              user_id: member.user_id,
+              username: (member as any).profile?.username || 'Unknown',
+              team_name: (member as any).profile?.username || 'Unknown',
+              points: 0,
+            });
+            continue;
+          }
+
+          const { data: teamData } = await supabase
+            .from('teams')
+            .select('total_points, name')
+            .eq('id', member.team_id)
+            .single();
+
+          currentScores.push({
+            user_id: member.user_id,
+            username: (member as any).profile?.username || 'Unknown',
+            team_name: teamData?.name || `${(member as any).profile?.username || 'Unknown'}'s Team`,
+            points: teamData?.total_points || 0,
+          });
+        }
+      }
+
+      currentScores.sort((a, b) => b.points - a.points);
+      setCurrentLeaderboard(currentScores);
+
+      // OVERALL LEADERBOARD
+      // For tournament leagues: sum of all finalized tournament scores
+      // For season leagues: same as current (since it's cumulative)
+      // Only fetch if: (1) Overall Season is selected, OR (2) overallLeaderboard is empty (initial load)
+      const shouldFetchOverall = selectedLeaderboardTournamentId === null || overallLeaderboard.length === 0;
+      let overallList: LeaderboardEntry[] = [];
+      
+      if (shouldFetchOverall) {
+        const overallScores: Record<string, LeaderboardEntry> = {};
+
+        if (league?.league_type === 'tournament') {
+        // Tournament league: sum ALL tournament points (real-time season total)
+        for (const member of membersData) {
+          // Skip if no team_id yet
+          if (!member.team_id) {
+            overallScores[member.user_id] = {
+              user_id: member.user_id,
+              username: (member as any).profile?.username || 'Unknown',
+              team_name: (member as any).profile?.username || 'Unknown',
+              points: 0,
+            };
+            continue;
+          }
+
+          // Get team name
+          const { data: teamData, error: teamError } = await supabase
+            .from('teams')
+            .select('name')
+            .eq('id', member.team_id)
+            .maybeSingle();
+
+          if (teamError) {
+            console.error('❌ Error fetching team data for member:', (member as any).profile?.username, teamError);
+          }
+
+          // Use database aggregation for better performance (scales to 100+ tournaments)
+          const { data: aggregateData } = await supabase
+            .rpc('get_team_season_totals', {
+              p_team_id: member.team_id,
+              p_league_id: id
+            });
+
+          const totalPoints = aggregateData?.[0]?.total_points || 0;
+          const totalWins = aggregateData?.[0]?.total_wins || 0;
+          const totalLosses = aggregateData?.[0]?.total_losses || 0;
+          const totalDraws = aggregateData?.[0]?.total_draws || 0;
+          const totalGames = aggregateData?.[0]?.total_games || 0;
+
+
+          overallScores[member.user_id] = {
+            user_id: member.user_id,
+            username: (member as any).profile?.username || 'Unknown',
+            team_name: teamData?.name || `${(member as any).profile?.username || 'Unknown'}'s Team`,
+            points: totalPoints,
+            wins: totalWins,
+            losses: totalLosses,
+            draws: totalDraws,
+            total_games: totalGames,
+          };
+        }
+      } else {
+        // Season league: overall = current (it's already cumulative)
+        currentScores.forEach(score => {
+          overallScores[score.user_id] = { ...score };
+        });
+      }
+
+        overallList = Object.values(overallScores).sort((a, b) => b.points - a.points);
+        setOverallLeaderboard(overallList);
+      } else {
+        // Use existing overallLeaderboard if we didn't fetch
+        overallList = overallLeaderboard;
+      }
+
+      // Cache the leaderboard data
+      if (league?.id) {
+        const cacheKey = `${league.id}-${selectedLeaderboardTournamentId || 'overall'}`;
+        leaderboardCache.set(cacheKey, {
+          current: currentScores,
+          overall: overallList
+        });
+      }
+
+    } catch (error) {
+      console.error('Error fetching leaderboards:', error);
+    } finally {
+      setLeaderboardLoading(false);
+      // Stop animation after data is loaded
+      setTimeout(() => setIsAnimating(false), 100);
+    }
+  };
+
+  // Animate score counting effect
+  useEffect(() => {
+    if (!isAnimating) return;
+
+    const leaderboardToAnimate = selectedLeaderboardTournamentId === null ? overallLeaderboard : currentLeaderboard;
+    if (leaderboardToAnimate.length === 0) return;
+
+    // Initialize animated scores with random starting values
+    const initialScores: {[key: string]: number} = {};
+    leaderboardToAnimate.forEach(entry => {
+      initialScores[entry.user_id] = Math.random() * 50; // Start with random number
+    });
+    setAnimatedScores(initialScores);
+
+    // Animate towards real scores
+    const interval = setInterval(() => {
+      setAnimatedScores(prev => {
+        const newScores = { ...prev };
+        let allComplete = true;
+
+        leaderboardToAnimate.forEach(entry => {
+          const target = entry.points;
+          const current = newScores[entry.user_id] || 0;
+          const diff = target - current;
+
+          if (Math.abs(diff) > 0.1) {
+            allComplete = false;
+            // Move towards target with easing
+            newScores[entry.user_id] = current + diff * 0.3;
+          } else {
+            newScores[entry.user_id] = target;
+          }
+        });
+
+        if (allComplete) {
+          setIsAnimating(false);
+        }
+
+        return newScores;
+      });
+    }, 50);
+
+    return () => clearInterval(interval);
+  }, [isAnimating, currentLeaderboard, overallLeaderboard, selectedLeaderboardTournamentId]);
+
+  const onRefresh = async () => {
+    setRefreshing(true);
+    
+    // Refetch data based on active tab
+    if (activeTab === 'matchups') {
+      // Clear cache and ensure teams are loaded BEFORE fetching matchups for team highlighting
+      teamsCache.delete(id as string);
+      await fetchTeams();
+      await fetchMatchups();
+      setTimeout(() => setRefreshing(false), 1000);
+    } else if (activeTab === 'leaderboard') {
+      fetchLeaderboards();
+      setTimeout(() => setRefreshing(false), 1000);
+    } else if (activeTab === 'teams') {
+      teamsCache.delete(id as string); // Clear cache to force fresh fetch
+      fetchTeams();
+      setTimeout(() => setRefreshing(false), 1000);
+    } else if (activeTab === 'drafts') {
+      teamsCache.delete(id as string); // Clear cache to get updated member count
+      fetchTeams(); // Refresh teams to update member count
+      supabase
+        .from('leagues')
+        .select('*')
+        .eq('id', id)
+        .single()
+        .then(({ data: leagueData, error }) => {
+          if (!error && leagueData) {
+            setLeague(leagueData);
+          } else if (error) {
+            console.error('❌ Error refreshing league data:', error);
+          }
+          setRefreshing(false);
+        });
+    }
+  };
+
+  // Fetch ALL matchups for ALL tournaments and cache them
+  const fetchAllMatchupsForLeague = async () => {
+    if (!user || !league) return;
+
+    try {
+      
+      // Get user's team
+      const { data: membership } = await supabase
+        .from('league_memberships')
+        .select('team_id')
+        .eq('league_id', id)
+        .eq('user_id', user.id)
+        .single();
+
+      if (!membership?.team_id) return;
+
+      // Get all tournaments for this league
+      const tournaments = leagueTournaments.filter((t: any) => t.player_count > 0);
+      if (tournaments.length === 0) return;
+
+      // Fetch matchups for each tournament
+      for (const tournament of tournaments) {
+        const tournamentId = tournament.tournament_id;
+        
+        // Get user's players for this tournament from team_players or old_team_players
+        const { data: teamPlayers } = await supabase
+          .from('team_players')
+          .select('player_fide_id')
+          .eq('team_id', membership.team_id)
+          .eq('league_id', id)
+          .eq('tournament_id', tournamentId);
+
+        let playerIds = teamPlayers?.map(p => p.player_fide_id) || [];
+        
+        // If no active players, check archived players
+        if (playerIds.length === 0) {
+          const { data: oldTeamPlayers } = await supabase
+            .from('old_team_players')
+            .select('player_fide_id')
+            .eq('team_id', membership.team_id)
+            .eq('league_id', id)
+            .eq('tournament_id', tournamentId);
+          
+          playerIds = oldTeamPlayers?.map(p => p.player_fide_id) || [];
+        }
+        
+        if (playerIds.length === 0) continue;
+
+        // Get ALL matchups for this tournament (all rounds)
+        const { data: matchupsData } = await supabase
+          .from('tournament_pairings')
+          .select(`
+            id,
+            round_number,
+            result,
+            tournament_id,
+            white_player_fide_id,
+            black_player_fide_id,
+            white_player:players!tournament_pairings_white_player_fide_id_fkey(fide_id, name, rating, country, title),
+            black_player:players!tournament_pairings_black_player_fide_id_fkey(fide_id, name, rating, country, title)
+          `)
+          .eq('tournament_id', tournamentId)
+          .or(`white_player_fide_id.in.(${playerIds.join(',')}),black_player_fide_id.in.(${playerIds.join(',')})`)
+          .order('round_number');
+
+        if (!matchupsData) continue;
+
+        // Get fantasy points for all games
+        const gameIds = matchupsData.map((m: any) => m.id);
+        let fantasyPointsMap: Record<string, { white: number; black: number }> = {};
+
+        if (gameIds.length > 0) {
+          const { data: pointsData } = await supabase
+            .from('game_fantasy_points')
+            .select('pairing_id, player_fide_id, total_points')
+            .eq('league_id', id)
+            .in('pairing_id', gameIds);
+
+          pointsData?.forEach((p: any) => {
+            if (!fantasyPointsMap[p.pairing_id]) {
+              fantasyPointsMap[p.pairing_id] = { white: 0, black: 0 };
+            }
+            const matchup = matchupsData.find((m: any) => m.id === p.pairing_id);
+            if (matchup) {
+              if (matchup.white_player_fide_id === p.player_fide_id) {
+                fantasyPointsMap[p.pairing_id].white = p.total_points;
+              } else if (matchup.black_player_fide_id === p.player_fide_id) {
+                fantasyPointsMap[p.pairing_id].black = p.total_points;
+              }
+            }
+          });
+        }
+
+        // Get team names from cache
+        const allPlayerIds = matchupsData.flatMap((m: any) => [m.white_player_fide_id, m.black_player_fide_id]);
+        const playerTeamMap: Record<string, string> = {};
+        allPlayerIds.forEach(pid => {
+          playerTeamMap[pid] = teamOwnershipCache[pid] || '';
+        });
+
+        // Format matchups
+        const formattedMatchups = matchupsData.map((m: any) => ({
+          id: m.id,
+          round_number: m.round_number,
+          white_player: Array.isArray(m.white_player) ? m.white_player[0] : m.white_player,
+          black_player: Array.isArray(m.black_player) ? m.black_player[0] : m.black_player,
+          white_team_name: playerTeamMap[m.white_player_fide_id],
+          black_team_name: playerTeamMap[m.black_player_fide_id],
+          status: m.result || 'scheduled',
+          white_classical_score: m.result === 'white_win' ? 1 : m.result === 'draw' ? 0.5 : 0,
+          black_classical_score: m.result === 'black_win' ? 1 : m.result === 'draw' ? 0.5 : 0,
+          white_fantasy_points: fantasyPointsMap[m.id]?.white,
+          black_fantasy_points: fantasyPointsMap[m.id]?.black,
+        }));
+
+        // Cache matchups by round for this tournament
+        const roundGroups = formattedMatchups.reduce((acc: any, m: any) => {
+          if (!acc[m.round_number]) acc[m.round_number] = [];
+          acc[m.round_number].push(m);
+          return acc;
+        }, {});
+
+        Object.keys(roundGroups).forEach(round => {
+          const cacheKey = `${league.id}-${tournamentId}-${round}`;
+          matchupsCache.set(cacheKey, roundGroups[round]);
+        });
+      }
+
+    } catch (error) {
+      console.error('Error fetching all matchups:', error);
+    }
+  };
+
+  const fetchMatchups = async () => {
+    if (!user) return;
+
+    setMatchupsLoading(true);
+    try {
+      // Get user's team
+      const { data: membership } = await supabase
+        .from('league_memberships')
+        .select('team_id')
+        .eq('league_id', id)
+        .eq('user_id', user.id)
+        .single();
+
+      if (!membership?.team_id) {
+        setMatchups([]);
+        return;
+      }
+
+      // For tournament leagues, use selected tournament or first drafted tournament
+      let tournamentIdToUse = selectedMatchupTournamentId;
+      const draftedTournaments = leagueTournaments.filter((t: any) => t.player_count > 0);
+      if (league?.league_type === 'tournament' && !tournamentIdToUse && draftedTournaments.length > 0) {
+        tournamentIdToUse = draftedTournaments[0].tournament_id;
+        setSelectedMatchupTournamentId(tournamentIdToUse);
+      }
+      
+      if (league?.league_type === 'tournament' && !tournamentIdToUse) {
+        setMatchups([]);
+        return;
+      }
+
+      // Get user's players from team_players (active) or old_team_players (archived)
+      let playersQuery = supabase
+        .from('team_players')
+        .select('player_fide_id')
+        .eq('team_id', membership.team_id)
+        .eq('league_id', id);
+
+      // Filter by tournament for tournament leagues
+      if (league?.league_type === 'tournament' && tournamentIdToUse) {
+        playersQuery = playersQuery.eq('tournament_id', tournamentIdToUse);
+      }
+
+      const { data: teamPlayers } = await playersQuery;
+      let playerIds = teamPlayers?.map(p => p.player_fide_id) || [];
+
+      // If no active players found, check archived players for completed tournaments
+      if (playerIds.length === 0 && league?.league_type === 'tournament' && tournamentIdToUse) {
+        const { data: oldTeamPlayers } = await supabase
+          .from('old_team_players')
+          .select('player_fide_id')
+          .eq('team_id', membership.team_id)
+          .eq('league_id', id)
+          .eq('tournament_id', tournamentIdToUse);
+        
+        playerIds = oldTeamPlayers?.map(p => p.player_fide_id) || [];
+      }
+
+      setUserPlayerIds(playerIds);
+
+      if (playerIds.length === 0) {
+        setMatchups([]);
+        return;
+      }
+
+      // Get matchups for user's players from tournament_pairings
+      let matchupsQuery = supabase
+        .from('tournament_pairings')
+        .select(`
+          id,
+          round_number,
+          result,
+          opening_name,
+          eco_code,
+          move_count,
+          lichess_game_url,
+          white_player_fide_id,
+          black_player_fide_id,
+          white_player:players!tournament_pairings_white_player_fide_id_fkey(fide_id, name, rating, country, title),
+          black_player:players!tournament_pairings_black_player_fide_id_fkey(fide_id, name, rating, country, title)
+        `)
+        .eq('round_number', currentRound)
+        .or(`white_player_fide_id.in.(${playerIds.join(',')}),black_player_fide_id.in.(${playerIds.join(',')})`)
+        .order('round_number');
+
+      // Filter by tournament for tournament leagues
+      if (league?.league_type === 'tournament' && tournamentIdToUse) {
+        matchupsQuery = matchupsQuery.eq('tournament_id', tournamentIdToUse);
+      }
+
+      const { data: matchupsData } = await matchupsQuery;
+
+      // Get max round for this tournament
+      let maxRoundQuery = supabase
+        .from('tournament_pairings')
+        .select('round_number')
+        .or(`white_player_fide_id.in.(${playerIds.join(',')}),black_player_fide_id.in.(${playerIds.join(',')})`)
+        .order('round_number', { ascending: false })
+        .limit(1);
+
+      if (league?.league_type === 'tournament' && tournamentIdToUse) {
+        maxRoundQuery = maxRoundQuery.eq('tournament_id', tournamentIdToUse);
+      }
+
+      const { data: maxRoundData, error: maxRoundError } = await maxRoundQuery.single();
+      if (maxRoundData && !maxRoundError) {
+        setMaxRound(maxRoundData.round_number);
+      } else {
+        // If no matchups yet, try to get max round from round_schedule
+        const selectedTournament = leagueTournaments.find((t: any) => t.tournament_id === tournamentIdToUse);
+        if (selectedTournament?.round_schedule) {
+          try {
+            // round_schedule is already a JSONB object from the database, no need to parse
+            const schedule = Array.isArray(selectedTournament.round_schedule) 
+              ? selectedTournament.round_schedule 
+              : JSON.parse(selectedTournament.round_schedule);
+            const maxRoundFromSchedule = Math.max(...schedule.map((r: any) => r.round_number || 0));
+            if (maxRoundFromSchedule > 0) {
+              setMaxRound(maxRoundFromSchedule);
+            } else {
+              // If round_schedule exists but has no valid rounds, default to 1
+              setMaxRound(1);
+            }
+          } catch (e) {
+            console.error('Error parsing round schedule for max round:', e);
+            setMaxRound(1);
+          }
+        } else {
+          // No round_schedule found, default to 1
+          setMaxRound(1);
+        }
+      }
+
+      // Fetch fantasy points for these games
+      const gameIds = matchupsData?.map((m: any) => m.id) || [];
+      let fantasyPointsMap: Record<string, { white: number; black: number }> = {};
+
+      if (gameIds.length > 0) {
+        const { data: pointsData } = await supabase
+          .from('game_fantasy_points')
+          .select('pairing_id, player_fide_id, total_points')
+          .eq('league_id', id)
+          .in('pairing_id', gameIds);
+
+        // Build map of pairing_id -> {white_points, black_points}
+        pointsData?.forEach((p: any) => {
+          if (!fantasyPointsMap[p.pairing_id]) {
+            fantasyPointsMap[p.pairing_id] = { white: 0, black: 0 };
+          }
+          // Find which player this is using fide_id fields
+          const matchup = matchupsData?.find((m: any) => m.id === p.pairing_id);
+          if (matchup) {
+            if (matchup.white_player_fide_id === p.player_fide_id) {
+              fantasyPointsMap[p.pairing_id].white = p.total_points;
+            } else if (matchup.black_player_fide_id === p.player_fide_id) {
+              fantasyPointsMap[p.pairing_id].black = p.total_points;
+            }
+          }
+        });
+      }
+
+      // Use cached team ownership data (instant!)
+      const allPlayerIds = matchupsData?.flatMap((m: any) => [m.white_player_fide_id, m.black_player_fide_id]) || [];
+      const playerTeamMap: Record<string, string> = {};
+      allPlayerIds.forEach(pid => {
+        playerTeamMap[pid] = teamOwnershipCache[pid] || '';
+      });
+
+      // Map to old format for compatibility
+      // Note: Supabase returns foreign key relations as arrays, so we take the first element
+      const formattedMatchups = matchupsData?.map((m: any) => ({
+        id: m.id,
+        round_number: m.round_number,
+        white_player: Array.isArray(m.white_player) ? m.white_player[0] : m.white_player,
+        black_player: Array.isArray(m.black_player) ? m.black_player[0] : m.black_player,
+        white_team_name: playerTeamMap[m.white_player_fide_id],
+        black_team_name: playerTeamMap[m.black_player_fide_id],
+        status: m.result || 'scheduled',
+        white_classical_score: m.result === 'white_win' ? 1 : m.result === 'draw' ? 0.5 : 0,
+        black_classical_score: m.result === 'black_win' ? 1 : m.result === 'draw' ? 0.5 : 0,
+        white_fantasy_points: fantasyPointsMap[m.id]?.white,
+        black_fantasy_points: fantasyPointsMap[m.id]?.black,
+      })) || [];
+
+      setMatchups(formattedMatchups as any);
+      
+      // Cache the matchups for this tournament and round
+      const cacheKey = `${league.id}-${tournamentIdToUse}-${currentRound}`;
+      matchupsCache.set(cacheKey, formattedMatchups as any);
+    } catch (error) {
+      console.error('Error fetching matchups:', error);
+      setMatchups([]);
+    } finally {
+      setMatchupsLoading(false);
+    }
+  };
+
+  const fetchSeasonLeagueTournaments = async () => {
+    if (!league || league.league_type !== 'season' || !user) return;
+    
+    try {
+      // Get user's team first
+      const { data: membership } = await supabase
+        .from('league_memberships')
+        .select('team_id')
+        .eq('league_id', id)
+        .eq('user_id', user.id)
+        .single();
+      
+      if (!membership?.team_id) return;
+      
+      // Get only user's team player IDs from team_players or old_team_players
+      const { data: teamPlayers } = await supabase
+        .from('team_players')
+        .select('player_fide_id')
+        .eq('team_id', membership.team_id)
+        .eq('league_id', id)
+        .eq('season_id', league.season_id);
+      
+      let playerIds = teamPlayers?.map(p => p.player_fide_id) || [];
+      
+      // If no active players, check archived players
+      if (playerIds.length === 0) {
+        const { data: oldTeamPlayers } = await supabase
+          .from('old_team_players')
+          .select('player_fide_id')
+          .eq('team_id', membership.team_id)
+          .eq('league_id', id)
+          .eq('season_id', league.season_id);
+        
+        playerIds = oldTeamPlayers?.map(p => p.player_fide_id) || [];
+      }
+      
+      if (playerIds.length === 0) return;
+      
+      // Get players' tournament_id arrays to find upcoming tournaments
+      const { data: players } = await supabase
+        .from('players')
+        .select('fide_id, name, tournament_id')
+        .in('fide_id', playerIds)
+        .not('tournament_id', 'is', null);
+      
+      // Map tournament IDs to player names
+      const tournamentPlayers = new Map<string, string[]>();
+      players?.forEach(p => {
+        if (Array.isArray(p.tournament_id)) {
+          p.tournament_id.forEach(tid => {
+            if (!tournamentPlayers.has(tid)) {
+              tournamentPlayers.set(tid, []);
+            }
+            tournamentPlayers.get(tid)!.push(p.name);
+          });
+        }
+      });
+      
+      if (tournamentPlayers.size === 0) return;
+      
+      // Get tournament details for active, upcoming, and completed tournaments
+      // Include completed so users can view previous weeks' matchups
+      const { data: tournaments } = await supabase
+        .from('tournaments')
+        .select('id, name, start_date, end_date, location, status')
+        .in('id', Array.from(tournamentPlayers.keys()))
+        .in('status', ['active', 'upcoming', 'completed'])
+        .order('start_date', { ascending: true });
+      
+      // Add player names to each tournament
+      const tournamentsWithPlayers = tournaments?.map(t => ({
+        ...t,
+        playerNames: tournamentPlayers.get(t.id) || []
+      })) || [];
+      
+      setAvailableTournaments(tournamentsWithPlayers as any);
+      
+      // Select first active tournament, or first upcoming if no active
+      if (tournamentsWithPlayers && tournamentsWithPlayers.length > 0 && !selectedTournamentId) {
+        const activeTourn = tournamentsWithPlayers.find(t => t.status === 'active');
+        setSelectedTournamentId(activeTourn?.id || tournamentsWithPlayers[0].id);
+      }
+    } catch (error) {
+      console.error('Error fetching season league tournaments:', error);
+    }
+  };
+
+  const fetchSeasonLeagueMatchups = async () => {
+    if (!selectedTournamentId || !user || !league?.season_id) return;
+    
+    try {
+      // Get user's team
+      const { data: membership } = await supabase
+        .from('league_memberships')
+        .select('team_id')
+        .eq('league_id', id)
+        .eq('user_id', user.id)
+        .single();
+      
+      if (!membership?.team_id) {
+        setGamesByDate({});
+        return;
+      }
+      
+      // Get user's players for this season from team_players or old_team_players
+      const { data: teamPlayers } = await supabase
+        .from('team_players')
+        .select('player_fide_id')
+        .eq('team_id', membership.team_id)
+        .eq('league_id', id)
+        .eq('season_id', league.season_id);
+      
+      let playerIds = teamPlayers?.map(p => p.player_fide_id) || [];
+      
+      // If no active players, check archived players
+      if (playerIds.length === 0) {
+        const { data: oldTeamPlayers } = await supabase
+          .from('old_team_players')
+          .select('player_fide_id')
+          .eq('team_id', membership.team_id)
+          .eq('league_id', id)
+          .eq('season_id', league.season_id);
+        
+        playerIds = oldTeamPlayers?.map(p => p.player_fide_id) || [];
+      }
+      
+      setUserPlayerIds(playerIds);
+      
+      if (playerIds.length === 0) {
+        setGamesByDate({});
+        return;
+      }
+      
+      // Calculate week date range
+      const weekEnd = new Date(weekStartDate);
+      weekEnd.setDate(weekEnd.getDate() + 6);
+      
+      // Get games for this tournament and week
+      const { data: gamesData } = await supabase
+        .from('tournament_pairings')
+        .select(`
+          id,
+          round_number,
+          result,
+          game_date,
+          opening_name,
+          eco_code,
+          move_count,
+          lichess_game_url,
+          white_player_fide_id,
+          black_player_fide_id,
+          white_player:players!tournament_pairings_white_player_fide_id_fkey(fide_id, name, rating, country, title),
+          black_player:players!tournament_pairings_black_player_fide_id_fkey(fide_id, name, rating, country, title)
+        `)
+        .eq('tournament_id', selectedTournamentId)
+        .gte('game_date', weekStartDate.toISOString().split('T')[0])
+        .lte('game_date', weekEnd.toISOString().split('T')[0])
+        .or(`white_player_fide_id.in.(${playerIds.join(',')}),black_player_fide_id.in.(${playerIds.join(',')})`)
+        .order('game_date', { ascending: true });
+      
+      // Fetch fantasy points
+      const gameIds = gamesData?.map(g => g.id) || [];
+      let fantasyPointsMap: Record<string, { white: number; black: number }> = {};
+      
+      if (gameIds.length > 0) {
+        const { data: pointsData } = await supabase
+          .from('game_fantasy_points')
+          .select('pairing_id, player_fide_id, total_points')
+          .eq('league_id', id)
+          .in('pairing_id', gameIds);
+        
+        pointsData?.forEach(p => {
+          if (!fantasyPointsMap[p.pairing_id]) {
+            fantasyPointsMap[p.pairing_id] = { white: 0, black: 0 };
+          }
+          const game = gamesData?.find(g => g.id === p.pairing_id);
+          if (game) {
+            if (game.white_player_fide_id === p.player_fide_id) {
+              fantasyPointsMap[p.pairing_id].white = p.total_points;
+            } else if (game.black_player_fide_id === p.player_fide_id) {
+              fantasyPointsMap[p.pairing_id].black = p.total_points;
+            }
+          }
+        });
+      }
+      
+      // Use cached team ownership data (instant!)
+      const allPlayerIds = gamesData?.flatMap(g => [g.white_player_fide_id, g.black_player_fide_id]) || [];
+      const playerTeamMap: Record<string, string> = {};
+      allPlayerIds.forEach(pid => {
+        playerTeamMap[pid] = teamOwnershipCache[pid] || '';
+      });
+
+      // Group games by date
+      const grouped: Record<string, any[]> = {};
+      gamesData?.forEach(game => {
+        if (!game.game_date) return;
+        const dateKey = game.game_date;
+        if (!grouped[dateKey]) {
+          grouped[dateKey] = [];
+        }
+        grouped[dateKey].push({
+          id: game.id,
+          round_number: game.round_number,
+          white_player: Array.isArray(game.white_player) ? game.white_player[0] : game.white_player,
+          black_player: Array.isArray(game.black_player) ? game.black_player[0] : game.black_player,
+          white_team_name: playerTeamMap[game.white_player_fide_id],
+          black_team_name: playerTeamMap[game.black_player_fide_id],
+          status: game.result || 'scheduled',
+          white_classical_score: game.result === 'white_win' ? 1 : game.result === 'draw' ? 0.5 : 0,
+          black_classical_score: game.result === 'black_win' ? 1 : game.result === 'draw' ? 0.5 : 0,
+          white_fantasy_points: fantasyPointsMap[game.id]?.white,
+          black_fantasy_points: fantasyPointsMap[game.id]?.black,
+        });
+      });
+      
+      setGamesByDate(grouped);
+    } catch (error) {
+      console.error('Error fetching season league matchups:', error);
+    }
+  };
+
+  const startDraft = async (tournamentId: string, tournamentName: string) => {
+    if (!league || !user) return;
+
+    // Show confirmation dialog
+    Alert.alert(
+      'Start Draft',
+      `Are you sure you want to start the draft for ${tournamentName}?\n\nWarning: Ensure all league members are ready before starting.`,
+      [
+        {
+          text: 'Cancel',
+          style: 'cancel'
+        },
+        {
+          text: 'Start Draft',
+          style: 'default',
+          onPress: async () => {
+            try {
+              setStartingDraft(true);
+              await performStartDraft(tournamentId);
+            } catch (error) {
+              console.error('Error starting draft:', error);
+              Alert.alert('Error', 'Failed to start draft');
+            } finally {
+              setStartingDraft(false);
+            }
+          }
+        }
+      ]
+    );
+  };
+
+  const performStartDraft = async (tournamentId: string | null) => {
+    if (!league || !user) return;
+
+    // Security check: Only league owner can start draft
+    if (league.owner_id !== user.id) {
+      console.error('❌ Permission denied: Only league owner can start draft');
+      Alert.alert('Permission Denied', 'Only the league owner can start the draft');
+      return;
+    }
+
+
+    try {
+
+      // 1. Update league status to 'drafting'
+      const { error: statusError } = await supabase
+        .from('leagues')
+        .update({ status: 'drafting' })
+        .eq('id', league.id);
+
+      if (statusError) throw statusError;
+
+      // 2. Get all league members
+      const { data: memberships, error: membersError } = await supabase
+        .from('league_memberships')
+        .select('id, user_id, team_id')
+        .eq('league_id', league.id);
+
+      if (membersError) throw membersError;
+
+      // 3. Randomize draft order
+      const shuffled = [...(memberships || [])].sort(() => Math.random() - 0.5);
+      
+      // 4. Update each membership with draft_order
+      for (let i = 0; i < shuffled.length; i++) {
+        const { error: orderError } = await supabase
+          .from('league_memberships')
+          .update({ draft_order: i + 1 })
+          .eq('id', shuffled[i].id);
+
+        if (orderError) throw orderError;
+      }
+
+      // 5. Delete any existing draft_state for this league (in case of restart)
+      
+      // First check how many draft states exist
+      const { data: existingStates, error: checkError } = await supabase
+        .from('draft_state')
+        .select('id, tournament_id')
+        .eq('league_id', league.id);
+      
+      if (checkError) {
+        console.warn('⚠️ Error checking existing draft states:', checkError);
+      } else {
+      }
+      
+      // Delete ALL draft states for this league
+      const { error: deleteError } = await supabase
+        .from('draft_state')
+        .delete()
+        .eq('league_id', league.id);
+
+      if (deleteError) {
+        console.error('❌ Error deleting old draft state:', deleteError);
+        throw deleteError; // Don't continue if we can't delete old states
+      } else {
+      }
+
+      // Wait a moment to ensure deletion is complete
+      await new Promise(resolve => setTimeout(resolve, 1000));
+
+      // 6. Create new draft_state with tournament_id (null for season leagues)
+      const firstTeamId = shuffled[0]?.team_id;
+      const draftStateData: any = {
+        league_id: league.id,
+        current_pick_number: 1,
+        current_team_id: firstTeamId,
+        pick_deadline: new Date(Date.now() + 60000).toISOString(), // 60 seconds
+        is_active: true
+      };
+      
+      // Only add tournament_id if it's not null (tournament leagues only)
+      if (tournamentId) {
+        draftStateData.tournament_id = tournamentId;
+      }
+      
+      
+      const { error: draftStateError, data: insertedDraftState } = await supabase
+        .from('draft_state')
+        .insert(draftStateData)
+        .select()
+        .single();
+
+      if (draftStateError) {
+        console.error('❌ Error creating draft state:', draftStateError);
+        throw draftStateError;
+      }
+      
+
+      // 7. Update local state and navigate to draft room
+      setLeague(prev => prev ? { ...prev, status: 'drafting' } : null);
+      
+      // Wait another moment before navigation to ensure everything is committed
+      await new Promise(resolve => setTimeout(resolve, 500));
+      
+      router.push(`/draft-room/${id}`);
+    } catch (error) {
+      console.error('❌ Error in performStartDraft:', error);
+      throw error;
+    }
+  };
+
+  // Fetch chat messages
+  const fetchMessages = async () => {
+    if (!id) return;
+
+    try {
+      const { data, error } = await supabase
+        .from('league_messages')
+        .select(`
+          *,
+          profiles(username)
+        `)
+        .eq('league_id', id)
+        .order('created_at', { ascending: true });
+
+      if (error) throw error;
+
+      const messagesWithUsernames = data?.map(msg => ({
+        ...msg,
+        username: msg.profiles?.username || 'Unknown'
+      })) || [];
+
+      setMessages(messagesWithUsernames);
+    } catch (error) {
+      console.error('Error fetching messages:', error);
+    }
+  };
+
+  // Send a chat message
+  const sendMessage = async () => {
+    if (!newMessage.trim() || !user || !profile || sendingMessage) return;
+
+    const messageText = newMessage.trim();
+    setSendingMessage(true);
+    setNewMessage('');
+
+    // Optimistically add message to UI
+    const tempMessage: ChatMessage = {
+      id: `temp-${Date.now()}`,
+      league_id: id as string,
+      user_id: user.id,
+      message: messageText,
+      created_at: new Date().toISOString(),
+      username: profile.username
+    };
+    setMessages(prev => [...prev, tempMessage]);
+
+    // Scroll to bottom
+    setTimeout(() => {
+      chatScrollRef.current?.scrollToEnd({ animated: true });
+    }, 100);
+
+    try {
+      const { data, error } = await supabase
+        .from('league_messages')
+        .insert({
+          league_id: id,
+          user_id: user.id,
+          message: messageText
+        })
+        .select()
+        .single();
+
+      if (error) throw error;
+
+      // Replace temp message with real one
+      if (data) {
+        setMessages(prev => prev.map(m => 
+          m.id === tempMessage.id 
+            ? { ...data, username: profile.username } as ChatMessage
+            : m
+        ));
+      }
+    } catch (error) {
+      console.error('Error sending message:', error);
+      Alert.alert('Error', 'Failed to send message');
+      // Remove temp message on error
+      setMessages(prev => prev.filter(m => m.id !== tempMessage.id));
+      setNewMessage(messageText); // Restore message text
+    } finally {
+      setSendingMessage(false);
+    }
+  };
+
+  // Load chat mute status
+  const loadChatMuteStatus = async () => {
+    if (!user || !id) return;
+
+    try {
+      const { data, error } = await supabase
+        .from('league_notification_preferences')
+        .select('mute_chat')
+        .eq('user_id', user.id)
+        .eq('league_id', id)
+        .single();
+
+      if (error && error.code !== 'PGRST116') { // PGRST116 = no rows returned
+        console.error('Error loading mute status:', error);
+        return;
+      }
+
+      setChatMuted(data?.mute_chat || false);
+    } catch (error) {
+      console.error('Error loading mute status:', error);
+    }
+  };
+
+  // Toggle chat mute
+  const toggleChatMute = async () => {
+    if (!user || !id || togglingMute) return;
+
+    setTogglingMute(true);
+
+    try {
+      const newMuteStatus = !chatMuted;
+
+      const { error } = await supabase.rpc('toggle_league_chat_mute', {
+        p_user_id: user.id,
+        p_league_id: id,
+        p_mute: newMuteStatus
+      });
+
+      if (error) throw error;
+
+      setChatMuted(newMuteStatus);
+      Alert.alert(
+        newMuteStatus ? 'Chat Muted' : 'Chat Unmuted',
+        newMuteStatus 
+          ? 'You will no longer receive notifications for messages in this league'
+          : 'You will now receive notifications for messages in this league'
+      );
+    } catch (error) {
+      console.error('Error toggling mute:', error);
+      Alert.alert('Error', 'Failed to update notification settings');
+    } finally {
+      setTogglingMute(false);
+    }
+  };
+
+  // Check for unviewed tournament reports
+  const checkForUnviewedReports = async () => {
+    if (!user || !id) return;
+
+    try {
+      const { data, error } = await supabase.rpc('get_unviewed_reports', {
+        p_league_id: id,
+        p_user_id: user.id
+      });
+
+      if (error) throw error;
+
+      // Show the most recent unviewed report
+      if (data && data.length > 0) {
+        setTournamentReport(data[0]);
+        setReportModalVisible(true);
+      }
+    } catch (error) {
+      console.error('Error checking for unviewed reports:', error);
+    }
+  };
+
+  // Mark report as viewed
+  const markReportViewed = async () => {
+    if (!user || !tournamentReport) return;
+
+    try {
+      await supabase.rpc('mark_report_viewed', {
+        p_report_id: tournamentReport.report_id,
+        p_user_id: user.id
+      });
+
+      setReportModalVisible(false);
+      setTournamentReport(null);
+      
+      // Check if there are more unviewed reports
+      setTimeout(() => checkForUnviewedReports(), 500);
+    } catch (error) {
+      console.error('Error marking report as viewed:', error);
+    }
+  };
+
+  // Fetch scheduled drafts
+  const fetchScheduledDrafts = async () => {
+    if (!id) return;
+
+    try {
+      const { data, error } = await supabase
+        .from('scheduled_drafts')
+        .select('*')
+        .eq('league_id', id)
+        .eq('draft_started', false);
+
+      if (error) throw error;
+
+      const draftsMap: Record<string, any> = {};
+      data?.forEach(draft => {
+        if (draft.tournament_id) {
+          draftsMap[draft.tournament_id] = draft;
+        }
+      });
+      setScheduledDrafts(draftsMap);
+    } catch (error) {
+      console.error('Error fetching scheduled drafts:', error);
+    }
+  };
+
+  // Invite handlers for teams tab
+  const handleInviteUser = async () => {
+    if (!inviteUsername.trim() || !user) return;
+
+    try {
+      // Check if league is at max capacity
+      const { count: currentMemberCount } = await supabase
+        .from('league_memberships')
+        .select('*', { count: 'exact' })
+        .eq('league_id', id);
+
+      if (currentMemberCount && league && currentMemberCount >= league.max_members) {
+        Alert.alert('Error', 'League is at maximum capacity. Cannot send more invites.');
+        return;
+      }
+
+      // Check if user exists
+      const { data: inviteeProfile, error: profileError } = await supabase
+        .from('profiles')
+        .select('username')
+        .eq('username', inviteUsername)
+        .single();
+
+      if (profileError || !inviteeProfile) {
+        Alert.alert('Error', 'User not found');
+        return;
+      }
+
+      // Check if already invited
+      const { count } = await supabase
+        .from('league_invites')
+        .select('*', { count: 'exact' })
+        .eq('league_id', id)
+        .eq('invitee_username', inviteUsername)
+        .eq('status', 'pending');
+
+      if (count && count > 0) {
+        Alert.alert('Error', 'User has already been invited');
+        return;
+      }
+
+      // Send invite
+      const { error: inviteError } = await supabase
+        .from('league_invites')
+        .insert({
+          league_id: id,
+          inviter_id: user.id,
+          invitee_username: inviteUsername,
+          status: 'pending',
+        });
+
+      if (inviteError) throw inviteError;
+
+      Alert.alert('Success', `Invite sent to ${inviteUsername}`);
+      setInviteUsername('');
+    } catch (error) {
+      console.error('Error inviting user:', error);
+      Alert.alert('Error', 'Failed to send invite');
+    }
+  };
+
+  const handleInviteByEmail = async () => {
+    if (!inviteEmail.trim() || !user) return;
+
+    // Validate email format
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(inviteEmail)) {
+      Alert.alert('Error', 'Please enter a valid email address');
+      return;
+    }
+
+    try {
+      // Check if league is at max capacity
+      const { count: currentMemberCount } = await supabase
+        .from('league_memberships')
+        .select('*', { count: 'exact' })
+        .eq('league_id', id);
+
+      if (currentMemberCount && league && currentMemberCount >= league.max_members) {
+        Alert.alert('Error', 'League is at maximum capacity. Cannot send more invites.');
+        return;
+      }
+
+      // Check if already invited by email
+      const { count } = await supabase
+        .from('email_invites')
+        .select('*', { count: 'exact' })
+        .eq('league_id', id)
+        .eq('invitee_email', inviteEmail)
+        .eq('status', 'pending');
+
+      if (count && count > 0) {
+        Alert.alert('Error', 'This email has already been invited');
+        return;
+      }
+
+      // Send email invite via Edge Function
+      const { data, error } = await supabase.functions.invoke('send-email-invite', {
+        body: {
+          league_id: id,
+          inviter_id: user.id,
+          invitee_email: inviteEmail,
+        },
+      });
+
+      // Check for any error or error response
+      if (error || !data || data?.success === false || data?.error) {
+        Alert.alert(
+          'Cannot Invite',
+          'Cannot invite this email. User may already have an account associated with this email. Please use the "Username" option to invite them instead.'
+        );
+        setInviteEmail('');
+        return;
+      }
+
+      // Success cases
+      if (data.email_sent === false) {
+        Alert.alert(
+          'Invite Created',
+          `Invite created for ${inviteEmail}. When they create an account with this email, they'll automatically receive the league invitation.`
+        );
+        setInviteEmail('');
+        return;
+      }
+
+      Alert.alert(
+        'Invite Sent!', 
+        `An email has been sent to ${inviteEmail} with instructions to download the app. When they sign up with this email address, they'll automatically receive your league invitation.`
+      );
+      setInviteEmail('');
+    } catch (error: any) {
+      console.error('Error sending email invite:', error);
+      Alert.alert(
+        'Cannot Invite',
+        'Cannot invite this email. User may already have an account associated with this email. Please use the "Username" option to invite them instead.'
+      );
+      setInviteEmail('');
+    }
+  };
+
+  // Open schedule modal
+  const openScheduleModal = (tournamentId: string, tournamentName: string) => {
+    setSchedulingTournamentId(tournamentId);
+    setSchedulingTournamentName(tournamentName);
+    const now = new Date();
+    now.setHours(now.getHours() + 2); // Default to 2 hours from now
+    setScheduledDate(now);
+    setScheduledTime(now);
+    setScheduleModalVisible(true);
+  };
+
+  // Schedule draft
+  const scheduleDraft = async () => {
+    if (!schedulingTournamentId || !user) return;
+
+    try {
+      // Combine date and time
+      const combinedDateTime = new Date(scheduledDate);
+      combinedDateTime.setHours(scheduledTime.getHours());
+      combinedDateTime.setMinutes(scheduledTime.getMinutes());
+
+      const { error } = await supabase
+        .from('scheduled_drafts')
+        .upsert({
+          league_id: id,
+          tournament_id: schedulingTournamentId,
+          scheduled_time: combinedDateTime.toISOString(),
+          created_by: user.id,
+        });
+
+      if (error) throw error;
+
+      Alert.alert('Success', `Draft scheduled for ${combinedDateTime.toLocaleString()}`);
+      setScheduleModalVisible(false);
+      fetchScheduledDrafts();
+    } catch (error) {
+      console.error('Error scheduling draft:', error);
+      Alert.alert('Error', 'Failed to schedule draft');
+    }
+  };
+
+  // Cancel scheduled draft
+  const cancelScheduledDraft = async (tournamentId: string) => {
+    if (!id) return;
+
+    Alert.alert(
+      'Cancel Scheduled Draft',
+      'Are you sure you want to cancel this scheduled draft?',
+      [
+        { text: 'No', style: 'cancel' },
+        {
+          text: 'Yes',
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              const { error } = await supabase
+                .from('scheduled_drafts')
+                .delete()
+                .eq('league_id', id)
+                .eq('tournament_id', tournamentId);
+
+              if (error) throw error;
+
+              Alert.alert('Success', 'Scheduled draft cancelled');
+              fetchScheduledDrafts();
+            } catch (error) {
+              console.error('Error cancelling scheduled draft:', error);
+              Alert.alert('Error', 'Failed to cancel scheduled draft');
+            }
+          }
+        }
+      ]
+    );
+  };
+
+  // Get time until draft
+  const getTimeUntilDraft = (scheduledTime: string) => {
+    const now = new Date();
+    const draftTime = new Date(scheduledTime);
+    const diff = draftTime.getTime() - now.getTime();
+
+    if (diff <= 0) return 'Starting now';
+
+    const days = Math.floor(diff / (1000 * 60 * 60 * 24));
+    const hours = Math.floor((diff % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
+    const minutes = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
+
+    if (days > 0) return `in ${days}d ${hours}h`;
+    if (hours > 0) return `in ${hours}h ${minutes}m`;
+    return `in ${minutes}m`;
+  };
+
+  // Keep ref in sync with chatModalVisible state and reset unread count when opening chat
+  useEffect(() => {
+    chatModalVisibleRef.current = chatModalVisible;
+    if (chatModalVisible && messages.length > 0) {
+      setUnreadCount(0);
+      // Save last read timestamp to AsyncStorage
+      const lastTimestamp = new Date(messages[messages.length - 1].created_at).getTime();
+      setLastMessageTimestamp(lastTimestamp);
+      AsyncStorage.setItem(`lastReadChat_${id}`, lastTimestamp.toString());
+    }
+  }, [chatModalVisible, messages, id]);
+
+  // Subscribe to real-time chat updates (always active on league page)
+  useEffect(() => {
+    if (!id) {
+      return;
+    }
+
+
+    const channel = supabase
+      .channel(`league_chat_${id}`, {
+        config: {
+          broadcast: { self: true },
+          presence: { key: user?.id || 'anonymous' },
+        },
+      })
+      .on(
+        'postgres_changes',
+        {
+          event: 'INSERT',
+          schema: 'public',
+          table: 'league_messages',
+          filter: `league_id=eq.${id}`
+        },
+        async (payload) => {
+          
+          // Fetch username for new message
+          const { data: profileData } = await supabase
+            .from('profiles')
+            .select('username')
+            .eq('id', payload.new.user_id)
+            .single();
+
+          const newMsg = {
+            ...payload.new,
+            username: profileData?.username || 'Unknown'
+          } as ChatMessage;
+
+
+          setMessages(prev => {
+            // Avoid duplicates
+            if (prev.some(m => m.id === newMsg.id)) {
+              return prev;
+            }
+            
+            // Increment unread count if chat is closed and message is from another user
+            if (!chatModalVisibleRef.current && newMsg.user_id !== user?.id) {
+              setUnreadCount(count => count + 1);
+            } else if (chatModalVisibleRef.current) {
+              // If chat is open, update last read timestamp
+              const timestamp = new Date(newMsg.created_at).getTime();
+              setLastMessageTimestamp(timestamp);
+              AsyncStorage.setItem(`lastReadChat_${id}`, timestamp.toString());
+            }
+            
+            return [...prev, newMsg];
+          });
+          
+          // Auto-scroll to bottom if chat is open
+          if (chatModalVisibleRef.current) {
+            setTimeout(() => {
+              chatScrollRef.current?.scrollToEnd({ animated: true });
+            }, 100);
+          }
+        }
+      )
+      .subscribe();
+
+    // Cleanup on unmount
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [id]);
+
+  // Load last read timestamp and fetch messages on mount
+  useEffect(() => {
+    if (!id) return;
+    
+    const loadLastRead = async () => {
+      const lastRead = await AsyncStorage.getItem(`lastReadChat_${id}`);
+      if (lastRead) {
+        const timestamp = parseInt(lastRead);
+        setLastMessageTimestamp(timestamp);
+      }
+    };
+    
+    loadLastRead();
+    fetchMessages(); // Fetch messages on mount to calculate unread count
+  }, [id]);
+
+  // Calculate unread count whenever messages change
+  useEffect(() => {
+    if (!id || lastMessageTimestamp === 0 || messages.length === 0) return;
+    
+    const unread = messages.filter(m => 
+      new Date(m.created_at).getTime() > lastMessageTimestamp && m.user_id !== user?.id
+    ).length;
+    setUnreadCount(unread);
+  }, [messages, lastMessageTimestamp, user?.id, id]);
+
+  // Fetch messages and load mute status when chat is opened
+  useEffect(() => {
+    if (!chatModalVisible || !id) return;
+
+    fetchMessages();
+    loadChatMuteStatus();
+  }, [chatModalVisible, id]);
+
+  // Show skeleton loader on initial load
+  if (!league && loading) {
+    return (
+      <View style={[styles.container, { backgroundColor: colors.background }]}>
+        <View style={[styles.header, { backgroundColor: colors.headerBackground, borderBottomColor: colors.border }]}>
+          <View style={styles.headerTop}>
+            <TouchableOpacity onPress={() => router.back()}>
+              <Text style={[styles.backButton, { color: colors.text }]}>←</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+        <ScrollView style={{ flex: 1 }}>
+          <SkeletonLoader type="matchup" count={5} />
+        </ScrollView>
+      </View>
+    );
+  }
+
+  if (!league) {
+    return (
+      <View style={[styles.container, { backgroundColor: colors.background }]}>
+        <Text style={[styles.errorText, { color: colors.text }]}>League not found</Text>
+      </View>
+    );
+  }
+
+  const getTournamentStatus = () => {
+    if (!tournament?.start_date) return 'upcoming';
+    
+    const now = new Date();
+    const startDate = new Date(tournament.start_date);
+    const endDate = tournament.end_date ? new Date(tournament.end_date) : null;
+    
+    if (endDate && now > endDate) {
+      return 'completed';
+    }
+    
+    if (now >= startDate) {
+      return 'ongoing';
+    }
+    
+    return 'upcoming';
+  };
+
+  const renderTeamsTab = () => (
+    <View style={styles.tabContent}>
+      {teams.length === 0 ? (
+        <Text style={[styles.emptyText, { color: colors.textSecondary }]}>No teams yet</Text>
+      ) : (
+        teams.map((team) => (
+          <View key={team.id} style={[styles.teamCard, { backgroundColor: colors.cardBackground, borderColor: colors.border }]}>
+            <TouchableOpacity
+              onPress={() => fetchTeamRoster(team.id)}
+              style={styles.teamHeader}
+            >
+              <View style={styles.teamHeaderLeft}>
+                <Image
+                  source={require('@/assets/images/fantasy pawns/14.png')}
+                  style={styles.teamAvatar}
+                  tintColor={colors.primary}
+                />
+                <Text style={[styles.teamName, { color: colors.text }]}>{team.name}</Text>
+              </View>
+              <Text style={[styles.expandIcon, { color: colors.textSecondary }]}>
+                {expandedTeams.has(team.id) ? '▼' : '▶'}
+              </Text>
+            </TouchableOpacity>
+
+            {expandedTeams.has(team.id) && teamRosters[team.id] && (
+              <View style={styles.rosterContainer}>
+                {teamRosters[team.id].length === 0 ? (
+                  <Text style={[styles.emptyRosterText, { color: colors.textSecondary }]}>No players drafted yet</Text>
+                ) : league?.league_type === 'season' ? (
+                  // Season leagues: no tournament grouping, just list players
+                  teamRosters[team.id].map((player) => (
+                    <View key={player.fide_id} style={styles.playerRow}>
+                      <View style={styles.playerInfo}>
+                        <TouchableOpacity onPress={() => handlePlayerClick(player.fide_id, player)}>
+                          <Text style={[styles.playerName, { color: colors.text }]}>
+                            {player.title && <Text style={styles.playerTitle}>{player.title} </Text>}
+                            {player.name}
+                          </Text>
+                        </TouchableOpacity>
+                        <Text style={[styles.playerDetails, { color: colors.textSecondary }]}>
+                          {player.country} • {getRatingForTimeControl(player, player.time_control)}
+                        </Text>
+                      </View>
+                    </View>
+                  ))
+                ) : (
+                  (() => {
+                    // Tournament leagues: Group players by tournament
+                    const playersByTournament: { [key: string]: { name: string; players: Player[] } } = {};
+                    teamRosters[team.id].forEach((player) => {
+                      const tournamentId = player.tournament_id || 'unknown';
+                      if (!playersByTournament[tournamentId]) {
+                        playersByTournament[tournamentId] = {
+                          name: player.tournament_name || 'Unknown Tournament',
+                          players: []
+                        };
+                      }
+                      playersByTournament[tournamentId].players.push(player);
+                    });
+
+                    // Render players grouped by tournament
+                    return Object.entries(playersByTournament).map(([tournamentId, { name, players }]) => (
+                      <View key={tournamentId}>
+                        <View style={styles.tournamentSectionHeader}>
+                          <Text style={styles.tournamentSectionIcon}>🏆</Text>
+                          <Text style={[styles.tournamentSectionTitle, { color: colors.text }]}>{name}</Text>
+                        </View>
+                        {players.map((player) => (
+                          <View key={`${tournamentId}-${player.fide_id}`} style={styles.playerRow}>
+                            <View style={styles.playerInfo}>
+                              <TouchableOpacity onPress={() => handlePlayerClick(player.fide_id, player)}>
+                                <Text style={[styles.playerName, { color: colors.text }]}>
+                                  {player.title && <Text style={styles.playerTitle}>{player.title} </Text>}
+                                  {player.name}
+                                </Text>
+                              </TouchableOpacity>
+                              <Text style={[styles.playerDetails, { color: colors.textSecondary }]}>
+                                {player.country} • {getRatingForTimeControl(player, player.time_control)}
+                              </Text>
+                            </View>
+                          </View>
+                        ))}
+                      </View>
+                    ));
+                  })()
+                )}
+              </View>
+            )}
+          </View>
+        ))
+      )}
+      
+      {/* Invite Members & Join Requests - Only show for owner when league is not full */}
+      {isOwner && league && memberCount < league.max_members && (
+          <View style={[styles.inviteSection, { backgroundColor: colors.cardBackground, borderColor: colors.border }]}>
+            {/* Join Requests Button (for public leagues) */}
+            {league?.is_public && (
+              <TouchableOpacity
+                style={[styles.joinRequestsButton, { backgroundColor: colors.primary }]}
+                onPress={() => router.push(`/league-join-requests/${id}?returnTab=teams`)}
+              >
+                <Text style={styles.joinRequestsButtonText}>📋 View Join Requests</Text>
+              </TouchableOpacity>
+            )}
+
+            <Text style={[styles.inviteSectionTitle, { color: colors.text }]}>Invite Members</Text>
+            
+            <View style={[styles.inviteModeToggle, { backgroundColor: colors.cardBackground }]}>
+              <TouchableOpacity
+                style={[styles.modeButton, inviteMode === 'username' && { backgroundColor: colors.primary }]}
+                onPress={() => setInviteMode('username')}
+              >
+                <Text style={[styles.modeButtonText, { color: inviteMode === 'username' ? '#fff' : colors.textSecondary }]}>
+                  Username
+                </Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.modeButton, inviteMode === 'email' && { backgroundColor: colors.primary }]}
+                onPress={() => setInviteMode('email')}
+              >
+                <Text style={[styles.modeButtonText, { color: inviteMode === 'email' ? '#fff' : colors.textSecondary }]}>
+                  Email
+                </Text>
+              </TouchableOpacity>
+            </View>
+
+            {inviteMode === 'username' ? (
+              <>
+                <TextInput
+                  style={[styles.inviteInput, { backgroundColor: colors.background, color: colors.text, borderColor: colors.border }]}
+                  value={inviteUsername}
+                  onChangeText={setInviteUsername}
+                  placeholder="Enter username"
+                  placeholderTextColor={colors.textTertiary}
+                  autoCapitalize="none"
+                />
+                <TouchableOpacity
+                  onPress={handleInviteUser}
+                  style={[styles.inviteButton, { backgroundColor: colors.primary }]}
+                  disabled={!inviteUsername.trim()}
+                >
+                  <Text style={styles.inviteButtonText}>Send Invite</Text>
+                </TouchableOpacity>
+              </>
+            ) : (
+              <>
+                <TextInput
+                  style={[styles.inviteInput, { backgroundColor: colors.background, color: colors.text, borderColor: colors.border }]}
+                  value={inviteEmail}
+                  onChangeText={setInviteEmail}
+                  placeholder="Enter email address"
+                  placeholderTextColor={colors.textTertiary}
+                  autoCapitalize="none"
+                  keyboardType="email-address"
+                />
+                <TouchableOpacity
+                  onPress={handleInviteByEmail}
+                  style={[styles.inviteButton, { backgroundColor: colors.primary }]}
+                  disabled={!inviteEmail.trim()}
+                >
+                  <Text style={styles.inviteButtonText}>Send Email Invite</Text>
+                </TouchableOpacity>
+                <Text style={[styles.inviteHelpText, { color: colors.textSecondary }]}>
+                  They'll receive an email with a link to join
+                </Text>
+              </>
+            )}
+          </View>
+      )}
+      
+      {/* Player Trades - Only show if user has a team AND league is active (draft complete) AND is a member AND players have been drafted */}
+      {userTeamId && user && league?.status === 'active' && isMember && hasAnyDraftedPlayers && (
+        <View style={styles.tradesSection}>
+          <PlayerTrades
+            leagueId={id as string}
+            teamId={userTeamId}
+            userId={user.id}
+            currentRoster={userRoster}
+            allTeams={teams}
+            league={league}
+            timeControl={currentTournamentTimeControl || undefined}
+            onTradeComplete={() => {
+              fetchTeams(); // Refresh all teams
+              if (userTeamId) fetchUserRoster(userTeamId); // Refresh user's roster
+            }}
+          />
+        </View>
+      )}
+      
+      {/* Open Market Trading - Only show if user has a team AND league is active (draft complete) AND is a member AND players have been drafted */}
+      {userTeamId && league?.status === 'active' && isMember && hasAnyDraftedPlayers && (
+        <View style={styles.openMarketSection}>
+          <OpenMarketTrading
+            leagueId={id as string}
+            teamId={userTeamId}
+            currentRoster={userRoster}
+            onTradeComplete={() => {
+              fetchTeams(); // Refresh all teams
+              if (userTeamId) fetchUserRoster(userTeamId); // Refresh user's roster
+            }}
+            onPlayerClick={handlePlayerClick}
+            timeControl={currentTournamentTimeControl || undefined}
+            tournamentId={league?.league_type === 'tournament' ? selectedMatchupTournamentId : null}
+          />
+        </View>
+      )}
+    </View>
+  );
+
+  const renderLeaderboardTab = () => {
+    // No loading spinner - we show animated scores immediately
+    return (
+    <View style={styles.content}>
+      {/* Tournament Selector - Show for tournament leagues with multiple tournaments */}
+      {league?.league_type === 'tournament' && leagueTournaments.filter((t: any) => t.player_count > 0).length > 0 && (
+        <>
+          {/* Tournament Selectors - First Row */}
+          <View style={[styles.tournamentSelector, { marginBottom: 8 }]}>
+            <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+{(() => {
+              // Build sorted list: active tournaments, then upcoming, then completed
+              
+              const activeTournaments = leagueTournaments.filter((t: any) => 
+                t.player_count > 0 && (t.tournament_status === 'ongoing' || t.tournament_status === 'active')
+              );
+              const upcomingTournaments = leagueTournaments.filter((t: any) => 
+                t.player_count > 0 && (t.tournament_status === 'scheduled' || t.tournament_status === 'upcoming')
+              );
+              const completedTournaments = leagueTournaments.filter((t: any) => 
+                t.player_count > 0 && t.tournament_status === 'completed'
+              );
+
+
+              return (
+                <>
+                  {/* Active tournaments first */}
+                  {activeTournaments.map((t: any) => (
+                    <TouchableOpacity
+                      key={t.tournament_id}
+                      style={[
+                        styles.tournamentSelectorButton,
+                        { backgroundColor: colors.cardBackground, borderColor: colors.border },
+                        selectedLeaderboardTournamentId === t.tournament_id && { borderColor: colors.primary, backgroundColor: colors.primary + '20' }
+                      ]}
+                      onPress={() => setSelectedLeaderboardTournamentId(t.tournament_id)}
+                    >
+                      <Text style={[
+                        styles.tournamentSelectorText,
+                        { color: selectedLeaderboardTournamentId === t.tournament_id ? colors.primary : colors.text }
+                      ]}>
+                        {t.tournament_name}
+                      </Text>
+                    </TouchableOpacity>
+                  ))}
+
+                  {/* Upcoming tournaments */}
+                  {upcomingTournaments.map((t: any) => (
+                    <TouchableOpacity
+                      key={t.tournament_id}
+                      style={[
+                        styles.tournamentSelectorButton,
+                        { backgroundColor: colors.cardBackground, borderColor: colors.border },
+                        selectedLeaderboardTournamentId === t.tournament_id && { borderColor: colors.primary, backgroundColor: colors.primary + '20' }
+                      ]}
+                      onPress={() => setSelectedLeaderboardTournamentId(t.tournament_id)}
+                    >
+                      <Text style={[
+                        styles.tournamentSelectorText,
+                        { color: selectedLeaderboardTournamentId === t.tournament_id ? colors.primary : colors.text }
+                      ]}>
+                        {t.tournament_name}
+                      </Text>
+                    </TouchableOpacity>
+                  ))}
+
+                  {/* Completed tournaments last */}
+                  {completedTournaments.map((t: any) => (
+                    <TouchableOpacity
+                      key={t.tournament_id}
+                      style={[
+                        styles.tournamentSelectorButton,
+                        { backgroundColor: colors.cardBackground, borderColor: colors.border, opacity: 0.6 },
+                        selectedLeaderboardTournamentId === t.tournament_id && { borderColor: colors.primary, backgroundColor: colors.primary + '20', opacity: 1 }
+                      ]}
+                      onPress={() => setSelectedLeaderboardTournamentId(t.tournament_id)}
+                    >
+                      <Text style={[
+                        styles.tournamentSelectorText,
+                        { color: selectedLeaderboardTournamentId === t.tournament_id ? colors.primary : colors.text }
+                      ]}>
+                        {t.tournament_name}
+                      </Text>
+                    </TouchableOpacity>
+                  ))}
+                </>
+              );
+            })()}
+            </ScrollView>
+          </View>
+
+          {/* Overall Season Selector - Second Row */}
+          <View style={styles.tournamentSelector}>
+            <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+              <TouchableOpacity
+                style={[
+                  styles.tournamentSelectorButton,
+                  { backgroundColor: colors.cardBackground, borderColor: colors.border },
+                  selectedLeaderboardTournamentId === null && { borderColor: colors.primary, backgroundColor: colors.primary + '20' }
+                ]}
+                onPress={() => setSelectedLeaderboardTournamentId(null)}
+              >
+                <Text style={[
+                  styles.tournamentSelectorText,
+                  { color: selectedLeaderboardTournamentId === null ? colors.primary : colors.text }
+                ]}>
+                  Overall Season
+                </Text>
+              </TouchableOpacity>
+            </ScrollView>
+          </View>
+        </>
+      )}
+
+      {league?.league_type === 'season' ? (
+        // Season League: Single leaderboard
+        <>
+          <View style={[styles.leaderboardSection, { marginTop: 8 }]}>
+            <Text style={[styles.sectionHeader, { color: colors.text }]}>Season Leaderboard</Text>
+          {currentLeaderboard.map((entry, index) => {
+            const displayScore = isAnimating && animatedScores[entry.user_id] !== undefined 
+              ? animatedScores[entry.user_id] 
+              : entry.points;
+            
+            
+            return (
+              <View key={entry.user_id} style={[styles.leaderboardRow, { backgroundColor: colors.cardBackground, borderColor: colors.border }]}>
+                <View style={[styles.rankBadge, { backgroundColor: colors.background }]}>
+                  <Text style={[styles.rankText, { color: colors.text }]}>#{index + 1}</Text>
+                </View>
+                <Image
+                  source={require('@/assets/images/fantasy pawns/13.png')}
+                  style={styles.leaderboardAvatar}
+                  tintColor={index === 0 ? '#fbbf24' : index === 1 ? '#94a3b8' : index === 2 ? '#cd7f32' : '#64748b'}
+                />
+                <View style={styles.leaderboardInfo}>
+                  <Text style={[styles.leaderboardName, { color: colors.text }]}>{entry.team_name}</Text>
+                </View>
+                <TouchableOpacity 
+                  style={styles.leaderboardPointsContainer}
+                  onPress={() => Alert.alert(
+                    '',
+                    displayScore.toFixed(6),
+                    [{ text: 'OK' }]
+                  )}
+                >
+                  <Text style={[styles.leaderboardPoints, { color: '#60a5fa' }]}>{displayScore.toFixed(1)} pts</Text>
+                  {entry.wins !== undefined && entry.total_games !== undefined && entry.total_games > 0 && (
+                    <Text style={[styles.classicalPoints, { color: colors.textSecondary }]}>
+                      {entry.wins}-{entry.draws}-{entry.losses}
+                    </Text>
+                  )}
+                </TouchableOpacity>
+              </View>
+            );
+          })}
+          </View>
+        </>
+      ) : (
+        // Tournament League: Show selected view
+        <>
+          <View style={[styles.leaderboardSection, { marginTop: 8 }]}>
+            {(selectedLeaderboardTournamentId === null ? overallLeaderboard : currentLeaderboard).map((entry, index) => {
+              const displayScore = isAnimating && animatedScores[entry.user_id] !== undefined 
+                ? animatedScores[entry.user_id] 
+                : entry.points;
+              
+              
+              return (
+                <View key={entry.user_id} style={[styles.leaderboardRow, { backgroundColor: colors.cardBackground, borderColor: colors.border }]}>
+                  <View style={[styles.rankBadge, { backgroundColor: colors.background }]}>
+                    <Text style={[styles.rankText, { color: colors.text }]}>#{index + 1}</Text>
+                  </View>
+                  <Image
+                    source={require('@/assets/images/fantasy pawns/13.png')}
+                    style={styles.leaderboardAvatar}
+                    tintColor={index === 0 ? '#fbbf24' : index === 1 ? '#94a3b8' : index === 2 ? '#cd7f32' : '#64748b'}
+                  />
+                  <View style={styles.leaderboardInfo}>
+                    <Text style={[styles.leaderboardName, { color: colors.text }]}>{entry.team_name}</Text>
+                  </View>
+                  <TouchableOpacity 
+                    style={styles.leaderboardPointsContainer}
+                    onPress={() => Alert.alert(
+                      '',
+                      displayScore.toFixed(6),
+                      [{ text: 'OK' }]
+                    )}
+                  >
+                    <Text style={[styles.leaderboardPoints, { color: '#60a5fa' }]}>{displayScore.toFixed(1)} pts</Text>
+                    {entry.wins !== undefined && entry.total_games !== undefined && entry.total_games > 0 && (
+                      <Text style={[styles.classicalPoints, { color: colors.textSecondary }]}>
+                        {entry.wins}-{entry.draws}-{entry.losses}
+                      </Text>
+                    )}
+                  </TouchableOpacity>
+                </View>
+              );
+            })}
+          </View>
+        </>
+      )}
+    </View>
+    );
+  };
+
+  const renderDraftsTab = () => {
+    // For season leagues, show different content
+    if (league?.league_type === 'season') {
+      return (
+        <View style={styles.tabContent}>
+          {/* Welcome Banner for Members Without Team */}
+          {!userTeamId && !isOwner && (
+            <View style={styles.welcomeBanner}>
+              <Text style={styles.welcomeBannerIcon}>👋</Text>
+              <View style={styles.welcomeBannerTextContainer}>
+                <Text style={styles.welcomeBannerTitle}>Welcome to {league?.name}!</Text>
+                <Text style={styles.welcomeBannerMessage}>
+                  You'll participate starting with the next season draft.
+                </Text>
+              </View>
+            </View>
+          )}
+
+          {/* Already Drafted Section */}
+          {userRoster.length > 0 && (
+            <>
+              <View style={styles.draftsSection}>
+                <Text style={[styles.draftsSectionTitle, { color: colors.text }]}>✅ Drafted</Text>
+                <Text style={[styles.draftsSectionSubtitle, { color: colors.textSecondary }]}>
+                  Your season draft is complete
+                </Text>
+              </View>
+              
+              <View style={[styles.draftedTournamentCard, { borderColor: colors.primary }]}>
+                <View style={styles.tournamentCardHeader}>
+                  <View style={styles.seasonIconContainer}>
+                    <Text style={styles.seasonIcon}>🏆</Text>
+                  </View>
+                  <View style={styles.tournamentCardInfo}>
+                    <Text style={[styles.tournamentCardName, { color: colors.text }]}>2026 Season</Text>
+                    <Text style={[styles.tournamentCardLocation, { color: colors.textSecondary }]}>
+                      📅 Year-long competition
+                    </Text>
+                    <Text style={[styles.draftedInfo, { color: colors.primary }]}>
+                      Drafted {userRoster.length} players
+                    </Text>
+                  </View>
+                </View>
+                <View style={[styles.draftedBadge, { backgroundColor: colors.success || '#10b981' }]}>
+                  <Text style={styles.draftedBadgeText}>✓ Drafted</Text>
+                </View>
+              </View>
+            </>
+          )}
+
+          {/* Draftable Season Section */}
+          {userRoster.length === 0 && (
+            <>
+              <View style={styles.draftsSection}>
+                <Text style={[styles.draftsSectionTitle, { color: colors.text }]}>🎯 Draftable</Text>
+                <Text style={[styles.draftsSectionSubtitle, { color: colors.textSecondary }]}>
+                  Start the season draft
+                </Text>
+              </View>
+
+              <View style={[styles.draftedTournamentCard, { borderColor: colors.primary }]}>
+                <View style={styles.tournamentCardHeader}>
+                  <View style={styles.seasonIconContainer}>
+                    <Text style={styles.seasonIcon}>🏆</Text>
+                  </View>
+                  <View style={styles.tournamentCardInfo}>
+                    <View style={styles.seasonTitleRow}>
+                      <Text style={[styles.tournamentCardName, { color: colors.text }]}>2026 Season</Text>
+                      <TouchableOpacity
+                        onPress={() => setSeasonInfoModalVisible(true)}
+                        style={[styles.infoButton, { backgroundColor: colors.cardBackground }]}
+                      >
+                        <Text style={[styles.infoButtonText, { color: colors.textSecondary }]}>ⓘ</Text>
+                      </TouchableOpacity>
+                    </View>
+                    <Text style={[styles.tournamentCardLocation, { color: colors.textSecondary }]}>
+                      📅 Year-long competition
+                    </Text>
+                  </View>
+                </View>
+                <View style={styles.draftButtonRow}>
+                  {scheduledDrafts[league.season_id || ''] && getTimeUntilDraft(scheduledDrafts[league.season_id || ''].scheduled_time) !== 'Starting now' ? (
+                    <View style={{ flex: 1 }}>
+                      <Text style={[styles.scheduledDraftText, { color: colors.primary }]}>
+                        Draft starts {getTimeUntilDraft(scheduledDrafts[league.season_id || ''].scheduled_time)}
+                      </Text>
+                      {isOwner && (
+                        <TouchableOpacity
+                          style={[styles.cancelScheduleButton, { borderColor: colors.border }]}
+                          onPress={() => league.season_id && cancelScheduledDraft(league.season_id)}
+                        >
+                          <Text style={[styles.cancelScheduleButtonText, { color: colors.textSecondary }]}>Cancel Schedule</Text>
+                        </TouchableOpacity>
+                      )}
+                    </View>
+                  ) : isOwner ? (
+                    <View style={{ flexDirection: 'row', gap: 8, flex: 1 }}>
+                      <TouchableOpacity
+                        style={[styles.draftButton, { flex: 1 }, (startingDraft || teams.length < league.max_members) && styles.draftButtonDisabled]}
+                        onPress={() => {
+                          if (!league?.season_id) {
+                            Alert.alert('Error', 'No season found for this league');
+                            return;
+                          }
+                          // For season leagues, pass null as tournament_id since there's no specific tournament
+                          startDraft(null as any, `${new Date().getFullYear()} Season`);
+                        }}
+                        disabled={startingDraft || teams.length < league.max_members}
+                      >
+                        {startingDraft ? (
+                          <ActivityIndicator color="#fff" />
+                        ) : (
+                          <Text style={styles.draftButtonText}>Start Draft</Text>
+                        )}
+                      </TouchableOpacity>
+                      <TouchableOpacity
+                        style={[styles.scheduleButton, { backgroundColor: colors.cardBackground, borderColor: colors.primary }]}
+                        onPress={() => league.season_id && openScheduleModal(league.season_id, `${new Date().getFullYear()} Season`)}
+                      >
+                        <Text style={[styles.scheduleButtonText, { color: colors.primary }]}>Schedule</Text>
+                      </TouchableOpacity>
+                    </View>
+                  ) : (
+                    <View style={[styles.draftButton, styles.draftButtonDisabled]}>
+                      <Text style={styles.draftButtonText}>Owner Only</Text>
+                    </View>
+                  )}
+                </View>
+              </View>
+            </>
+          )}
+        </View>
+      );
+    }
+
+    // For tournament leagues, show tournament-specific drafts
+    return (
+      <View style={styles.tabContent}>
+        {/* Show loading spinner during initial load */}
+        {loading ? (
+          <View style={[styles.loadingContainer, { backgroundColor: colors.background, justifyContent: 'flex-start', paddingTop: 100 }]}>
+            <ActivityIndicator size="large" color={colors.primary} />
+          </View>
+        ) : (
+          <>
+            {/* Welcome Banner for Members Without Team */}
+            {!userTeamId && !isOwner && (
+              <View style={styles.welcomeBanner}>
+                <Text style={styles.welcomeBannerIcon}>👋</Text>
+                <View style={styles.welcomeBannerTextContainer}>
+                  <Text style={styles.welcomeBannerTitle}>Welcome to {league?.name}!</Text>
+                  <Text style={styles.welcomeBannerMessage}>
+                    You'll participate starting with the next tournament draft.
+                  </Text>
+                </View>
+              </View>
+            )}
+
+        {/* Drafted Tournaments Section - Show First */}
+        {leagueTournaments.filter((t: any) => t.player_count > 0).length > 0 && (
+          <>
+            <View style={styles.draftsSection}>
+              <Text style={[styles.draftsSectionTitle, { color: colors.text }]}>✅ Drafted</Text>
+              <Text style={[styles.draftsSectionSubtitle, { color: colors.textSecondary }]}>
+                Tournaments you've already drafted for
+              </Text>
+            </View>
+
+            <View style={styles.tournamentsList}>
+              {leagueTournaments.filter((t: any) => t.player_count > 0).map((tournament: any) => (
+                <View key={tournament.tournament_id} style={[styles.draftedTournamentCard, { borderColor: colors.primary }]}>
+                  <View style={styles.tournamentCardHeader}>
+                    {tournament.icon_url && (
+                      <Image
+                        source={{ uri: tournament.icon_url }}
+                        style={styles.tournamentCardIcon}
+                        resizeMode="contain"
+                      />
+                    )}
+                    <View style={styles.tournamentCardInfo}>
+                      <Text style={[styles.tournamentCardName, { color: colors.text }]}>{tournament.tournament_name}</Text>
+                      <Text style={[styles.tournamentCardLocation, { color: colors.textSecondary }]}>
+                        📍 {tournament.location}
+                      </Text>
+                      <Text style={[styles.draftedInfo, { color: colors.primary }]}>
+                        Drafted {tournament.player_count} players
+                      </Text>
+                    </View>
+                  </View>
+                  <View style={styles.badgeContainer}>
+                    <View style={[styles.draftedBadge, { backgroundColor: colors.success || '#10b981' }]}>
+                      <Text style={styles.draftedBadgeText}>✓ Drafted</Text>
+                    </View>
+                    {tournament.status === 'completed' && (
+                      <View style={[styles.completedBadge, { backgroundColor: '#6b7280' }]}>
+                        <Text style={styles.completedBadgeText}>✓ Completed</Text>
+                      </View>
+                    )}
+                  </View>
+                </View>
+              ))}
+            </View>
+          </>
+        )}
+
+        {/* Draftable Tournaments Section - Show Second */}
+        {!loading && teams.length === league.max_members ? (
+          <>
+            <View style={styles.draftsSection}>
+              <Text style={[styles.draftsSectionTitle, { color: colors.text }]}>🎯 Draftable</Text>
+              <Text style={[styles.draftsSectionSubtitle, { color: colors.textSecondary }]}>
+                Start drafts for upcoming tournaments
+              </Text>
+            </View>
+
+            {/* Tournament Warning Banner - Show for tournaments <=3 days away */}
+            {draftableTournaments.filter((t: any) => !t.is_drafted && t.start_date).some((t: any) => {
+              const daysAway = Math.ceil((new Date(t.start_date).getTime() - new Date().getTime()) / (1000 * 60 * 60 * 24));
+              return daysAway <= 3 && daysAway > 0;
+            }) && (
+              <View style={[styles.tournamentWarningBanner, { backgroundColor: colors.cardBackground, borderColor: '#f59e0b' }]}>
+                <Text style={styles.tournamentWarningIcon}>⚠️</Text>
+                <View style={styles.tournamentWarningContent}>
+                  <Text style={[styles.tournamentWarningTitle, { color: colors.text }]}>Tournament Starting Soon</Text>
+                  <Text style={[styles.tournamentWarningText, { color: colors.textSecondary }]}>
+                    One or more tournaments start within 3 days. Draft your team soon!
+                  </Text>
+                </View>
+              </View>
+            )}
+
+            {draftableTournaments.filter((t: any) => !t.is_drafted).length === 0 ? (
+              <View style={styles.emptyStateContainer}>
+                <Text style={styles.emptyStateIcon}>📅</Text>
+                <Text style={[styles.emptyStateTitle, { color: colors.text }]}>No Draftable Tournaments</Text>
+                <Text style={[styles.emptyStateText, { color: colors.textSecondary }]}>
+                  No tournaments available for drafting right now. Tournaments become draftable 2 weeks before they start.
+                </Text>
+              </View>
+            ) : (
+              <View style={styles.tournamentsList}>
+                {draftableTournaments.filter((t: any) => !t.is_drafted).map((tournament: any) => (
+                  <View key={tournament.tournament_id} style={[styles.draftedTournamentCard, { borderColor: colors.primary }]}>
+                    <View style={styles.tournamentCardHeader}>
+                      {tournament.icon_url && (
+                        <Image
+                          source={{ uri: tournament.icon_url }}
+                          style={styles.tournamentCardIcon}
+                          resizeMode="contain"
+                        />
+                      )}
+                      <View style={styles.tournamentCardInfo}>
+                        <Text style={[styles.tournamentCardName, { color: colors.text }]}>{tournament.tournament_name}</Text>
+                        <Text style={[styles.tournamentCardLocation, { color: colors.textSecondary }]}>
+                          📍 {tournament.location}
+                        </Text>
+                        <Text style={[styles.tournamentCardDate, { color: colors.textSecondary }]}>
+                          📅 {tournament.start_date ? new Date(tournament.start_date).toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' }) : ''} - {tournament.end_date ? new Date(tournament.end_date).toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' }) : ''}
+                        </Text>
+                        <Text style={[styles.tournamentCardTimeControl, { color: colors.textSecondary }]}>
+                          ⏱️ {tournament.time_control ? tournament.time_control.charAt(0).toUpperCase() + tournament.time_control.slice(1) : ''}
+                        </Text>
+                      </View>
+                    </View>
+                    <View style={styles.draftButtonRow}>
+                      {scheduledDrafts[tournament.tournament_id] && getTimeUntilDraft(scheduledDrafts[tournament.tournament_id].scheduled_time) !== 'Starting now' ? (
+                        <View style={{ flex: 1 }}>
+                          <Text style={[styles.scheduledDraftText, { color: colors.primary }]}>
+                            Draft starts {getTimeUntilDraft(scheduledDrafts[tournament.tournament_id].scheduled_time)}
+                          </Text>
+                          {isOwner && (
+                            <TouchableOpacity
+                              style={[styles.cancelScheduleButton, { borderColor: colors.border }]}
+                              onPress={() => cancelScheduledDraft(tournament.tournament_id)}
+                            >
+                              <Text style={[styles.cancelScheduleButtonText, { color: colors.textSecondary }]}>Cancel Schedule</Text>
+                            </TouchableOpacity>
+                          )}
+                        </View>
+                      ) : isOwner ? (
+                        <View style={{ flexDirection: 'row', gap: 8, flex: 1 }}>
+                          <TouchableOpacity
+                            style={[styles.draftButton, { flex: 1 }, startingDraft && styles.draftButtonDisabled]}
+                            onPress={() => startDraft(tournament.tournament_id, tournament.tournament_name)}
+                            disabled={startingDraft}
+                          >
+                            {startingDraft ? (
+                              <ActivityIndicator color="#fff" />
+                            ) : (
+                              <Text style={styles.draftButtonText}>Start Draft</Text>
+                            )}
+                          </TouchableOpacity>
+                          <TouchableOpacity
+                            style={[styles.scheduleButton, { backgroundColor: colors.cardBackground, borderColor: colors.primary }]}
+                            onPress={() => openScheduleModal(tournament.tournament_id, tournament.tournament_name)}
+                          >
+                            <Text style={[styles.scheduleButtonText, { color: colors.primary }]}>Schedule</Text>
+                          </TouchableOpacity>
+                        </View>
+                      ) : (
+                        <View style={[styles.draftButton, styles.draftButtonDisabled]}>
+                          <Text style={styles.draftButtonText}>Owner Only</Text>
+                        </View>
+                      )}
+                    </View>
+                  </View>
+                ))}
+              </View>
+            )}
+          </>
+        ) : (
+          <View style={styles.emptyStateContainer}>
+            <Text style={styles.emptyStateIcon}>👥</Text>
+            <Text style={[styles.emptyStateTitle, { color: colors.text }]}>Waiting for Members</Text>
+            <Text style={[styles.emptyStateText, { color: colors.textSecondary }]}>
+              {teams.length} of {league.max_members} members have joined. You need all {league.max_members} members before you can start drafting.
+            </Text>
+          </View>
+        )}
+          </>
+        )}
+      </View>
+    );
+  };
+
+  const renderMatchupsTab = () => {
+    const tournamentStatus = getTournamentStatus();
+    
+    return (
+      <View style={styles.tabContent}>
+        {/* Tournament Info Banner - Only show for upcoming or ongoing tournaments */}
+        {league?.current_tournament_id && tournament && tournamentStatus !== 'completed' && (
+          <View style={[styles.upcomingTournamentBox, { backgroundColor: 'transparent', borderColor: colors.primary }]}>
+            <View style={styles.upcomingTournamentHeader}>
+              <Text style={styles.upcomingTournamentIcon}>
+                {tournamentStatus === 'upcoming' ? '📅' : '🏆'}
+              </Text>
+              <Text style={[styles.upcomingTournamentTitle, { color: tournamentStatus === 'ongoing' ? colors.primary : colors.text }]}>
+                {tournamentStatus === 'upcoming' ? 'Upcoming Tournament' : 'Ongoing Tournament'}
+              </Text>
+            </View>
+            <Text style={[styles.upcomingTournamentName, { color: colors.text }]}>{tournament.name}</Text>
+            {tournament.location && (
+              <Text style={[styles.upcomingTournamentLocation, { color: colors.textSecondary }]}>📍 {tournament.location}</Text>
+            )}
+            <View style={[styles.upcomingTournamentDivider, { backgroundColor: colors.border }]} />
+            <View style={styles.upcomingTournamentDraftInfo}>
+              <Text style={[styles.upcomingTournamentLabel, { color: colors.textSecondary }]}>
+                {tournamentStatus === 'upcoming' ? 'Tournament Starts:' : 'Started:'}
+              </Text>
+              <Text style={[styles.upcomingTournamentDate, { color: '#60a5fa' }]}>
+                {tournament.start_date
+                  ? new Date(tournament.start_date).toLocaleDateString('en-US', { 
+                      month: 'long', 
+                      day: 'numeric', 
+                      year: 'numeric',
+                      hour: 'numeric',
+                      minute: '2-digit'
+                    })
+                  : 'Date TBD'}
+              </Text>
+            </View>
+            {tournamentStatus === 'upcoming' && (
+              <Text style={[styles.upcomingTournamentNote, { color: colors.textSecondary }]}>
+                Make sure to complete your draft before the tournament begins!
+              </Text>
+            )}
+          </View>
+        )}
+
+
+        {/* Show message when NO drafted tournaments exist - ONLY for tournament leagues */}
+        {!loading && league?.league_type === 'tournament' && 
+         (draftableTournaments.length > 0 || leagueTournaments.length > 0) && 
+         leagueTournaments.filter((t: any) => t.player_count > 0).length === 0 && (
+          <View style={[styles.upcomingTournamentBox, { backgroundColor: 'transparent', borderColor: colors.border }]}>
+            <View style={styles.upcomingTournamentHeader}>
+              <Text style={styles.upcomingTournamentIcon}>⏳</Text>
+              <Text style={[styles.upcomingTournamentTitle, { color: colors.textSecondary }]}>
+                League Not Drafted
+              </Text>
+            </View>
+            <Text style={[styles.upcomingTournamentNote, { color: colors.textSecondary, textAlign: 'center' }]}>
+              {isOwner 
+                ? "You can start the draft from the Drafts tab to get your league started!"
+                : "The league owner can start the draft to initiate the league."}
+            </Text>
+          </View>
+        )}
+
+        {/* Tournament Selector - Show ONLY for season leagues */}
+        {league?.league_type === 'season' ? (
+          <>
+            {/* Tournament Selector */}
+            <View style={[styles.tournamentSelector, { backgroundColor: colors.cardBackground, borderColor: colors.border, borderWidth: 1 }]}>
+              <Text style={[styles.selectorLabel, { color: colors.text }]}>Tournaments:</Text>
+              {availableTournaments.length === 0 ? (
+                <Text style={[styles.emptyText, { color: colors.textSecondary, textAlign: 'center', marginTop: 8, marginBottom: 12 }]}>No tournaments found</Text>
+              ) : (
+                <ScrollView 
+                  horizontal 
+                  showsHorizontalScrollIndicator={false}
+                  contentContainerStyle={{ paddingRight: 8 }}
+                >
+                  {availableTournaments.map(t => {
+                    const startDate = t.start_date ? new Date(t.start_date) : null;
+                    const isUpcoming = t.status === 'upcoming';
+                    const dateStr = startDate ? startDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : '';
+                    const playerNames = (t as any).playerNames || [];
+                    
+                    return (
+                      <TouchableOpacity
+                        key={t.id}
+                        style={[
+                          styles.tournamentChip,
+                          selectedTournamentId === t.id && styles.tournamentChipActive,
+                          isUpcoming && styles.tournamentChipUpcoming
+                        ]}
+                        onPress={() => setSelectedTournamentId(t.id)}
+                      >
+                        <Text style={[
+                          styles.tournamentChipText,
+                          selectedTournamentId === t.id && styles.tournamentChipTextActive
+                        ]}>
+                          {t.name}
+                        </Text>
+                        {dateStr && (
+                          <Text style={[
+                            styles.tournamentChipDate,
+                            selectedTournamentId === t.id && styles.tournamentChipDateActive
+                          ]}>
+                            {isUpcoming ? `Starts ${dateStr}` : dateStr}
+                          </Text>
+                        )}
+                        {playerNames.length > 0 && (
+                          <View style={{ marginTop: 4 }}>
+                            <Text style={[
+                              styles.tournamentChipPlayersLabel,
+                              selectedTournamentId === t.id && styles.tournamentChipPlayersActive
+                            ]}>
+                              Participating Players:
+                            </Text>
+                            <Text style={[
+                              styles.tournamentChipPlayers,
+                              selectedTournamentId === t.id && styles.tournamentChipPlayersActive
+                            ]}>
+                              {playerNames.join(', ')}
+                            </Text>
+                          </View>
+                        )}
+                      </TouchableOpacity>
+                    );
+                  })}
+                </ScrollView>
+              )}
+            </View>
+
+            {/* Week Selector */}
+            <View style={[styles.weekSelector, { backgroundColor: colors.cardBackground, borderColor: colors.border, borderWidth: 1 }]}>
+              <TouchableOpacity
+                onPress={() => {
+                  const newDate = new Date(weekStartDate);
+                  newDate.setDate(newDate.getDate() - 7);
+                  setWeekStartDate(newDate);
+                }}
+                style={styles.weekButton}
+              >
+                <Text style={[styles.weekButtonText, { color: colors.text }]}>← Prev</Text>
+              </TouchableOpacity>
+              <Text style={[styles.weekText, { color: colors.text }]}>
+                {weekStartDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} - 
+                {new Date(weekStartDate.getTime() + 6 * 24 * 60 * 60 * 1000).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
+              </Text>
+              <TouchableOpacity
+                onPress={() => {
+                  const newDate = new Date(weekStartDate);
+                  newDate.setDate(newDate.getDate() + 7);
+                  setWeekStartDate(newDate);
+                }}
+                style={styles.weekButton}
+              >
+                <Text style={[styles.weekButtonText, { color: colors.text }]}>Next →</Text>
+              </TouchableOpacity>
+            </View>
+
+            {/* Games Grouped by Date */}
+            {Object.keys(gamesByDate).length === 0 ? (
+              (() => {
+                const selectedTourn = availableTournaments.find(t => t.id === selectedTournamentId);
+                const isUpcoming = selectedTourn?.status === 'upcoming';
+                const startDate = selectedTourn?.start_date ? new Date(selectedTourn.start_date).toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' }) : '';
+                
+                return (
+                  <View style={styles.emptyStateContainer}>
+                    <Text style={styles.emptyStateIcon}>{isUpcoming ? '📅' : '🏁'}</Text>
+                    <Text style={[styles.emptyStateTitle, { color: colors.text }]}>
+                      {isUpcoming ? 'Tournament Upcoming' : 'No Matchups Yet'}
+                    </Text>
+                    {isUpcoming && startDate && (
+                      <Text style={[styles.emptyStateText, { color: colors.textSecondary }]}>
+                        {selectedTourn?.name} starts on {startDate}. Matchups will appear once the tournament begins.
+                      </Text>
+                    )}
+                  </View>
+                );
+              })()
+            ) : (
+              Object.keys(gamesByDate).sort().map(dateKey => (
+                <View key={dateKey}>
+                  <Text style={styles.dateHeader}>{formatDateHeader(dateKey)}</Text>
+                  <View style={styles.matchupHeader}>
+                    <Text style={styles.matchupHeaderText}>White</Text>
+                    <Text style={styles.matchupHeaderText}>Result</Text>
+                    <Text style={styles.matchupHeaderText}>Black</Text>
+                  </View>
+                  {gamesByDate[dateKey].map((matchup) => {
+                    // Get user's team name
+                    const userTeam = teams.find((t: any) => t.user_id === user?.id);
+                    const userTeamName = userTeam?.name;
+                    
+                    const isWhiteMyPlayer = matchup.white_team_name === userTeamName;
+                    const isBlackMyPlayer = matchup.black_team_name === userTeamName;
+                    const isWhiteOpponent = !isWhiteMyPlayer && matchup.white_team_name;
+                    const isBlackOpponent = !isBlackMyPlayer && matchup.black_team_name;
+                    return (
+                      <TouchableOpacity 
+                        key={matchup.id} 
+                        style={[styles.matchupCard, { backgroundColor: colors.cardBackground, borderColor: colors.border }]}
+                        onPress={() => handleOpenLichess(matchup.lichess_game_url)}
+                        disabled={!matchup.lichess_game_url}
+                      >
+            <View style={styles.matchupRow}>
+              <View style={[styles.playerSide, isWhiteMyPlayer && styles.myPlayerSide, isWhiteOpponent && styles.opponentPlayerSide]}>
+                {(matchup.white_player as any)?.fide_id ? (
+                  <TouchableOpacity onPress={(e) => {
+                    e.stopPropagation();
+                    handlePlayerClick((matchup.white_player as any).fide_id, matchup.white_player);
+                  }}>
+                    <Text style={[styles.matchupPlayerName, { color: colors.text }]}>
+                      {(matchup.white_player as any)?.title && (
+                        <Text style={styles.playerTitle}>{(matchup.white_player as any).title} </Text>
+                      )}
+                      {(matchup.white_player as any)?.name || 'TBD'}
+                    </Text>
+                  </TouchableOpacity>
+                ) : (
+                  <Text style={[styles.matchupPlayerName, { color: colors.text }]}>TBD</Text>
+                )}
+                <Text style={[styles.matchupPlayerInfo, { color: colors.textSecondary }]}>
+                  {(matchup.white_player as any)?.country} • {(matchup.white_player as any)?.rating}
+                </Text>
+                {matchup.white_fantasy_points !== undefined && (
+                  <Text style={[
+                    styles.fantasyPoints,
+                    matchup.white_fantasy_points > 0 ? styles.positivePoints : styles.negativePoints
+                  ]}>
+                    {matchup.white_fantasy_points > 0 ? '+' : ''}{matchup.white_fantasy_points.toFixed(1)}
+                  </Text>
+                )}
+                {isWhiteOpponent && matchup.white_team_name && (
+                  <Text style={[styles.teamNameCorner, { color: colors.textSecondary }]}>{matchup.white_team_name.replace(/['']s [Tt]eam$/, '')}</Text>
+                )}
+              </View>
+              <View style={styles.matchupScore}>
+                <Text style={[styles.scoreText, { color: '#60a5fa' }]}>
+                  {matchup.white_classical_score} - {matchup.black_classical_score}
+                </Text>
+                <Text style={[styles.statusText, { color: colors.textSecondary }]}>{matchup.status}</Text>
+              </View>
+              <View style={[styles.playerSide, isBlackMyPlayer && styles.myPlayerSide, isBlackOpponent && styles.opponentPlayerSide]}>
+                {(matchup.black_player as any)?.fide_id ? (
+                  <TouchableOpacity onPress={(e) => {
+                    e.stopPropagation();
+                    handlePlayerClick((matchup.black_player as any).fide_id, matchup.black_player);
+                  }}>
+                    <Text style={[styles.matchupPlayerName, { color: colors.text }]}>
+                      {(matchup.black_player as any)?.title && (
+                        <Text style={styles.playerTitle}>{(matchup.black_player as any).title} </Text>
+                      )}
+                      {(matchup.black_player as any)?.name || 'TBD'}
+                    </Text>
+                  </TouchableOpacity>
+                ) : (
+                  <Text style={[styles.matchupPlayerName, { color: colors.text }]}>TBD</Text>
+                )}
+                <Text style={[styles.matchupPlayerInfo, { color: colors.textSecondary }]}>
+                  {(matchup.black_player as any)?.country} • {(matchup.black_player as any)?.rating}
+                </Text>
+                {matchup.black_fantasy_points !== undefined && (
+                  <Text style={[
+                    styles.fantasyPoints,
+                    matchup.black_fantasy_points > 0 ? styles.positivePoints : styles.negativePoints
+                  ]}>
+                    {matchup.black_fantasy_points > 0 ? '+' : ''}{matchup.black_fantasy_points.toFixed(1)}
+                  </Text>
+                )}
+                {isBlackOpponent && matchup.black_team_name && (
+                  <Text style={[styles.teamNameCorner, { color: colors.textSecondary }]}>{matchup.black_team_name.replace(/['']s [Tt]eam$/, '')}</Text>
+                )}
+              </View>
+            </View>
+            {(matchup.opening_name || matchup.move_count) && (
+              <View style={[styles.gameMetadata, { borderTopColor: colors.border }]}>
+                {matchup.opening_name && (
+                  <Text style={[styles.openingText, { color: colors.textSecondary }]} numberOfLines={1}>
+                    {matchup.opening_name}
+                  </Text>
+                )}
+                {matchup.move_count && (
+                  <Text style={[styles.moveCountText, { color: colors.textSecondary }]}>
+                    {matchup.move_count} moves
+                  </Text>
+                )}
+              </View>
+            )}
+          </TouchableOpacity>
+                    );
+                  })}
+                </View>
+              ))
+            )}
+          </>
+        ) : (
+          <>
+            {/* Tournament League: Tournament Selector - Show if multiple tournaments */}
+            {league?.league_type === 'tournament' && leagueTournaments.filter((t: any) => t.player_count > 0).length > 0 && (
+              <View style={[styles.tournamentSelector, { paddingTop: 0, marginLeft: -16 }]}>
+                <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+                  {leagueTournaments.filter((t: any) => t.player_count > 0).map(t => (
+                    <TouchableOpacity
+                      key={t.tournament_id}
+                      style={[
+                        styles.tournamentSelectorButton,
+                        { backgroundColor: colors.cardBackground, borderColor: colors.border },
+                        t.tournament_status === 'completed' && { opacity: 0.6 },
+                        selectedMatchupTournamentId === t.tournament_id && { borderColor: colors.primary, backgroundColor: colors.primary + '20', opacity: 1 }
+                      ]}
+                      onPress={() => setSelectedMatchupTournamentId(t.tournament_id)}
+                    >
+                      <Text style={[
+                        styles.tournamentSelectorText,
+                        { color: selectedMatchupTournamentId === t.tournament_id ? colors.primary : colors.text }
+                      ]}>
+                        {t.tournament_name}
+                      </Text>
+                    </TouchableOpacity>
+                  ))}
+                </ScrollView>
+              </View>
+            )}
+            
+            {/* Round Selector */}
+            {leagueTournaments.filter((t: any) => t.player_count > 0).length > 0 && (
+            <>
+            <View style={styles.roundSelector}>
+              <TouchableOpacity
+                onPress={() => setCurrentRound(Math.max(1, currentRound - 1))}
+                disabled={currentRound === 1}
+                style={[styles.roundButton, { backgroundColor: colors.cardBackground, borderColor: colors.border }, currentRound === 1 && styles.roundButtonDisabled]}
+              >
+                <Text style={[styles.roundButtonText, { color: colors.text }]}>←</Text>
+              </TouchableOpacity>
+              <View style={{ alignItems: 'center' }}>
+                <Text style={[styles.roundText, { color: colors.text }]}>Round {currentRound}</Text>
+                {(() => {
+                  // Get the selected tournament's round schedule
+                  const selectedTournament = leagueTournaments.find((t: any) => t.tournament_id === selectedMatchupTournamentId);
+                  if (selectedTournament?.round_schedule) {
+                    try {
+                      // round_schedule is already a JSONB object from the database, no need to parse
+                      const schedule = Array.isArray(selectedTournament.round_schedule) 
+                        ? selectedTournament.round_schedule 
+                        : JSON.parse(selectedTournament.round_schedule);
+                      const roundInfo = schedule.find((r: any) => r.round_number === currentRound);
+                      if (roundInfo?.starts_at) {
+                        const roundDate = new Date(roundInfo.starts_at);
+                        return (
+                          <Text style={[styles.roundDateTime, { color: colors.textSecondary }]}>
+                            {roundDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} • {roundDate.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', timeZoneName: 'short' })}
+                          </Text>
+                        );
+                      }
+                    } catch (e) {
+                      console.error('Error parsing round schedule:', e);
+                    }
+                  }
+                  return null;
+                })()}
+              </View>
+              <TouchableOpacity
+                onPress={() => setCurrentRound(Math.min(maxRound, currentRound + 1))}
+                disabled={currentRound === maxRound}
+                style={[styles.roundButton, { backgroundColor: colors.cardBackground, borderColor: colors.border }, currentRound === maxRound && styles.roundButtonDisabled]}
+              >
+                <Text style={[styles.roundButtonText, { color: colors.text }]}>→</Text>
+              </TouchableOpacity>
+            </View>
+
+            {matchupsLoading ? (
+              <SkeletonLoader type="matchup" count={3} />
+            ) : matchups.length === 0 ? (
+              <Text style={[styles.emptyText, { color: colors.textSecondary }]}>No matchups for your players in this round</Text>
+            ) : (
+              <>
+                <View style={styles.matchupHeader}>
+                  <Text style={[styles.matchupHeaderText, { color: colors.textSecondary }]}>White</Text>
+                  <Text style={[styles.matchupHeaderText, { color: colors.textSecondary }]}>Result</Text>
+                  <Text style={[styles.matchupHeaderText, { color: colors.textSecondary }]}>Black</Text>
+                </View>
+                {matchups.map((matchup) => {
+                  // Get user's team name
+                  const userTeam = teams.find((t: any) => t.user_id === user?.id);
+                  const userTeamName = userTeam?.name;
+                  
+                  const isWhiteMyPlayer = matchup.white_team_name === userTeamName;
+                  const isBlackMyPlayer = matchup.black_team_name === userTeamName;
+                  const isWhiteOpponent = !isWhiteMyPlayer && matchup.white_team_name;
+                  const isBlackOpponent = !isBlackMyPlayer && matchup.black_team_name;
+                  return (
+                    <TouchableOpacity 
+                      key={matchup.id} 
+                      style={[styles.matchupCard, { backgroundColor: colors.cardBackground, borderColor: colors.border }]}
+                      onPress={() => handleOpenLichess(matchup.lichess_game_url)}
+                      disabled={!matchup.lichess_game_url}
+                    >
+                      <View style={styles.matchupRow}>
+                        <View style={[styles.playerSide, isWhiteMyPlayer && styles.myPlayerSide, isWhiteOpponent && styles.opponentPlayerSide]}>
+                          {(matchup.white_player as any)?.fide_id ? (
+                            <TouchableOpacity onPress={(e) => {
+                              e.stopPropagation();
+                              handlePlayerClick((matchup.white_player as any).fide_id, matchup.white_player);
+                            }}>
+                              <Text style={[styles.matchupPlayerName, { color: colors.text }]}>
+                                {(matchup.white_player as any)?.title && (
+                                  <Text style={styles.playerTitle}>{(matchup.white_player as any).title} </Text>
+                                )}
+                                {(matchup.white_player as any)?.name || 'TBD'}
+                              </Text>
+                            </TouchableOpacity>
+                          ) : (
+                            <Text style={[styles.matchupPlayerName, { color: colors.text }]}>TBD</Text>
+                          )}
+                          <Text style={[styles.matchupPlayerInfo, { color: colors.textSecondary }]}>
+                            {(matchup.white_player as any)?.country} • {(matchup.white_player as any)?.rating}
+                          </Text>
+                          {matchup.white_fantasy_points !== undefined && (
+                            <Text style={[
+                              styles.fantasyPoints,
+                              matchup.white_fantasy_points > 0 ? styles.positivePoints : styles.negativePoints
+                            ]}>
+                              {matchup.white_fantasy_points > 0 ? '+' : ''}{matchup.white_fantasy_points.toFixed(1)}
+                            </Text>
+                          )}
+                          {isWhiteOpponent && matchup.white_team_name && (
+                            <Text style={[styles.teamNameCorner, { color: colors.textSecondary }]}>{matchup.white_team_name.replace(/['']s [Tt]eam$/, '')}</Text>
+                          )}
+                        </View>
+                        <View style={styles.matchupScore}>
+                          <Text style={[styles.scoreText, { color: '#60a5fa' }]}>
+                            {matchup.white_classical_score} - {matchup.black_classical_score}
+                          </Text>
+                          <Text style={[styles.statusText, { color: colors.textSecondary }]}>{matchup.status}</Text>
+                        </View>
+                        <View style={[styles.playerSide, isBlackMyPlayer && styles.myPlayerSide, isBlackOpponent && styles.opponentPlayerSide]}>
+                          {(matchup.black_player as any)?.fide_id ? (
+                            <TouchableOpacity onPress={(e) => {
+                              e.stopPropagation();
+                              handlePlayerClick((matchup.black_player as any).fide_id, matchup.black_player);
+                            }}>
+                              <Text style={[styles.matchupPlayerName, { color: colors.text }]}>
+                                {(matchup.black_player as any)?.title && (
+                                  <Text style={styles.playerTitle}>{(matchup.black_player as any).title} </Text>
+                                )}
+                                {(matchup.black_player as any)?.name || 'TBD'}
+                              </Text>
+                            </TouchableOpacity>
+                          ) : (
+                            <Text style={[styles.matchupPlayerName, { color: colors.text }]}>TBD</Text>
+                          )}
+                          <Text style={[styles.matchupPlayerInfo, { color: colors.textSecondary }]}>
+                            {(matchup.black_player as any)?.country} • {(matchup.black_player as any)?.rating}
+                          </Text>
+                          {matchup.black_fantasy_points !== undefined && (
+                            <Text style={[
+                              styles.fantasyPoints,
+                              matchup.black_fantasy_points > 0 ? styles.positivePoints : styles.negativePoints
+                            ]}>
+                              {matchup.black_fantasy_points > 0 ? '+' : ''}{matchup.black_fantasy_points.toFixed(1)}
+                            </Text>
+                          )}
+                          {isBlackOpponent && matchup.black_team_name && (
+                            <Text style={[styles.teamNameCorner, { color: colors.textSecondary }]}>{matchup.black_team_name.replace(/['']s [Tt]eam$/, '')}</Text>
+                          )}
+                        </View>
+                      </View>
+                      {(matchup.opening_name || matchup.move_count) && (
+                        <View style={[styles.gameMetadata, { borderTopColor: colors.border }]}>
+                          {matchup.opening_name && (
+                            <Text style={[styles.openingText, { color: colors.textSecondary }]} numberOfLines={1}>
+                              {matchup.opening_name}
+                            </Text>
+                          )}
+                          {matchup.move_count && (
+                            <Text style={[styles.moveCountText, { color: colors.textSecondary }]}>
+                              {matchup.move_count} moves
+                            </Text>
+                          )}
+                        </View>
+                      )}
+                    </TouchableOpacity>
+                  );
+                })}
+              </>
+            )}
+
+            {/* League Tournaments divider */}
+            {!loading && league?.league_type === 'tournament' && leagueTournaments.filter((t: any) => t.player_count > 0).length > 0 && (
+              <TouchableOpacity 
+                style={[styles.scrollIndicator, { borderTopColor: colors.border }]}
+                onPress={() => {
+                  setTournamentSectionCollapsed(!tournamentSectionCollapsed);
+                }}
+                activeOpacity={0.7}
+              >
+                <Text style={[styles.scrollIndicatorText, { color: colors.textSecondary }]}>League Tournaments</Text>
+                <Text style={[styles.scrollIndicatorText, { color: colors.textSecondary, fontSize: 16 }]}>
+                  {tournamentSectionCollapsed ? '▶' : '▼'}
+                </Text>
+              </TouchableOpacity>
+            )}
+
+            {/* Show all tournaments for tournament leagues - BELOW matchups */}
+            {!loading && league?.league_type === 'tournament' && leagueTournaments.filter((t: any) => t.player_count > 0).length > 0 && !tournamentSectionCollapsed && (
+              <View style={{ marginTop: 8 }}>
+                {leagueTournaments
+                  .filter((t: any) => t.player_count > 0)
+                  .sort((a: any, b: any) => {
+                    // Sort order: ongoing first, then upcoming, then completed
+                    const statusOrder: any = { 'active': 0, 'upcoming': 1, 'scheduled': 1, 'completed': 2 };
+                    const aOrder = statusOrder[a.tournament_status] ?? 3;
+                    const bOrder = statusOrder[b.tournament_status] ?? 3;
+                    if (aOrder !== bOrder) return aOrder - bOrder;
+                    // Within same status, sort by date
+                    return new Date(a.tournament_start_date).getTime() - new Date(b.tournament_start_date).getTime();
+                  })
+                  .map((tournament: any) => {
+                    const startDate = tournament.tournament_start_date ? new Date(tournament.tournament_start_date) : null;
+                    const isOngoing = tournament.tournament_status === 'active';
+                    const isCompleted = tournament.tournament_status === 'completed';
+                    const daysUntil = startDate && !isOngoing && !isCompleted ? Math.ceil((startDate.getTime() - new Date().getTime()) / (1000 * 60 * 60 * 24)) : null;
+                    
+                    return (
+                      <TouchableOpacity 
+                        key={tournament.tournament_id} 
+                        style={[
+                          styles.tournamentCardWide, 
+                          { backgroundColor: colors.cardBackground, borderColor: colors.primary },
+                          isCompleted && { opacity: 0.6 }
+                        ]}
+                        onPress={() => router.push(`/tournament/${tournament.tournament_id}`)}
+                        activeOpacity={0.7}
+                      >
+                        <View style={styles.upcomingTournamentCardHeader}>
+                          {tournament.icon_url && (
+                            <Image
+                              source={{ uri: tournament.icon_url }}
+                              style={styles.upcomingTournamentCardIcon}
+                              resizeMode="contain"
+                            />
+                          )}
+                          <View style={{ flex: 1 }}>
+                            <Text style={[styles.upcomingTournamentCardTitle, { color: colors.text }]}>
+                              {tournament.tournament_name}
+                            </Text>
+                            {tournament.location && (
+                              <Text style={[styles.upcomingTournamentCardLocation, { color: colors.textSecondary }]}>
+                                📍 {tournament.location}
+                              </Text>
+                            )}
+                          </View>
+                        </View>
+                        <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-end' }}>
+                          {startDate && (
+                            <Text style={[styles.upcomingTournamentCardDate, { color: isCompleted ? colors.textSecondary : colors.primary }]}>
+                              {isCompleted ? 'Ended' : isOngoing ? 'Started' : 'Starts'}: {startDate.toLocaleDateString('en-US', { 
+                                month: 'short', 
+                                day: 'numeric',
+                                hour: 'numeric',
+                                minute: '2-digit'
+                              })}
+                            </Text>
+                          )}
+                          {isCompleted ? (
+                            <View style={[styles.daysUntilBadge, { backgroundColor: '#64748b' }]}>
+                              <Text style={styles.daysUntilText}>Completed</Text>
+                            </View>
+                          ) : isOngoing ? (
+                            <View style={[styles.daysUntilBadge, { backgroundColor: '#10b981' }]}>
+                              <Text style={styles.daysUntilText}>Ongoing</Text>
+                            </View>
+                          ) : daysUntil !== null && (
+                            <View style={[styles.daysUntilBadge, { backgroundColor: daysUntil <= 3 ? '#f59e0b' : colors.primary }]}>
+                              <Text style={styles.daysUntilText}>
+                                {daysUntil === 0 ? 'Today' : daysUntil === 1 ? 'Tomorrow' : `${daysUntil}d`}
+                              </Text>
+                            </View>
+                          )}
+                        </View>
+                      </TouchableOpacity>
+                    );
+                  })}
+              </View>
+            )}
+
+            {/* Round Schedule - Show for tournament leagues */}
+            {tournament?.round_schedule && (
+              <View style={[styles.roundScheduleContainer, { backgroundColor: colors.cardBackground, borderColor: colors.border, marginTop: 24 }]}>
+                <Text style={[styles.roundScheduleTitle, { color: colors.text }]}>📅 Round Schedule</Text>
+                {JSON.parse(tournament.round_schedule).map((round: any) => {
+                  const roundDate = new Date(round.starts_at);
+                  const isPast = roundDate < new Date();
+                  return (
+                    <View key={round.round_id} style={[styles.roundScheduleRow, { borderBottomColor: colors.border }]}>
+                      <Text style={[styles.roundScheduleName, { color: isPast ? colors.textSecondary : colors.text }]}>
+                        {round.name}
+                      </Text>
+                      <Text style={[styles.roundScheduleDate, { color: isPast ? colors.textSecondary : colors.primary }]}>
+                        {roundDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}
+                      </Text>
+                    </View>
+                  );
+                })}
+              </View>
+            )}
+            </>
+            )}
+          </>
+        )}
+      </View>
+    );
+  };
+
+  const renderChatTab = () => (
+    <View style={{ flex: 1, backgroundColor: colors.background }}>
+      <ScrollView 
+        ref={chatScrollRef}
+        style={[styles.chatContainer, { backgroundColor: colors.background }]}
+        onContentSizeChange={() => chatScrollRef.current?.scrollToEnd({ animated: true })}
+      >
+        {messages.length === 0 ? (
+          <Text style={[styles.emptyText, { color: colors.textSecondary }]}>No messages yet. Start the conversation!</Text>
+        ) : (
+          messages.map((msg) => {
+            const isOwnMessage = msg.user_id === user?.id;
+            return (
+              <View 
+                key={msg.id} 
+                style={[
+                  styles.messageContainer,
+                  isOwnMessage ? { ...styles.ownMessage, backgroundColor: colors.primary } : { ...styles.otherMessage, backgroundColor: colors.cardBackground, borderColor: colors.border }
+                ]}
+              >
+                {!isOwnMessage && (
+                  <Text style={[styles.messageUsername, { color: colors.text }]}>{msg.username}</Text>
+                )}
+                <Text style={[styles.messageText, { color: isOwnMessage ? '#fff' : colors.text }]}>{msg.message}</Text>
+                <Text style={[styles.messageTime, { color: isOwnMessage ? 'rgba(255,255,255,0.7)' : colors.textSecondary }]}>
+                  {new Date(msg.created_at).toLocaleTimeString('en-US', { 
+                    hour: 'numeric', 
+                    minute: '2-digit' 
+                  })}
+                </Text>
+              </View>
+            );
+          })
+        )}
+      </ScrollView>
+      
+      {isMember ? (
+        <View style={[styles.chatInputContainer, { backgroundColor: colors.cardBackground, borderTopColor: colors.border }]}>
+          <TextInput
+            style={[styles.chatInput, { backgroundColor: colors.background, borderColor: colors.border, color: colors.text }]}
+            placeholder="Type a message..."
+            placeholderTextColor={colors.textTertiary}
+            value={newMessage}
+            onChangeText={setNewMessage}
+            multiline
+            maxLength={500}
+          />
+          <TouchableOpacity 
+            style={[styles.sendButton, { backgroundColor: colors.primary }, (!newMessage.trim() || sendingMessage) && styles.sendButtonDisabled]}
+            onPress={sendMessage}
+            disabled={!newMessage.trim() || sendingMessage}
+          >
+            <Text style={styles.sendButtonText}>
+              {sendingMessage ? '...' : '➤'}
+            </Text>
+          </TouchableOpacity>
+        </View>
+      ) : (
+        <View style={[styles.readOnlyNotice, { backgroundColor: colors.cardBackground, borderTopColor: colors.border }]}>
+          <Text style={[styles.readOnlyText, { color: colors.textSecondary }]}>👁️ Read-only: Join the league to send messages</Text>
+        </View>
+      )}
+    </View>
+  );
+
+  return (
+    <View style={{ flex: 1, backgroundColor: colors.background }}>
+      <Stack.Screen 
+        options={{ 
+          headerShown: false,
+          animation: 'none',
+          contentStyle: { backgroundColor: colors.background },
+          presentation: 'card'
+        }} 
+      />
+      <Animated.View 
+        style={[
+          styles.container, 
+          { 
+            backgroundColor: colors.background,
+            opacity: fadeAnim,
+            transform: [{ translateX: slideAnim }]
+          }
+        ]}
+      >
+          {/* Header */}
+          <View style={[styles.header, { backgroundColor: colors.headerBackground, borderBottomColor: colors.border }]}>
+            <View style={styles.headerTop}>
+              <TouchableOpacity onPress={() => {
+                if (from === 'home') {
+                  router.push('/(tabs)/home');
+                } else if (from === 'public-leagues') {
+                  router.push('/public-leagues');
+                } else {
+                  router.push('/(tabs)/leagues');
+                }
+              }} style={styles.backButton}>
+                <Text style={styles.backButtonText}>←</Text>
+              </TouchableOpacity>
+              <View style={styles.headerCenter}>
+                <Text style={[styles.leagueName, { color: colors.text }]}>{league.name}</Text>
+                {activeTournaments.length > 0 && (
+                  <ScrollView 
+                    horizontal 
+                    showsHorizontalScrollIndicator={false}
+                    style={styles.activeTournamentsScroll}
+                  >
+                    {activeTournaments.map((t: any) => (
+                      <View key={t.id} style={[styles.activeTournamentBadge, { backgroundColor: colors.cardBackground, borderColor: '#ef4444' }]}>
+                        <Text style={styles.activeTournamentPin}>📍</Text>
+                        <Text 
+                          style={[styles.activeTournamentText, { color: colors.text }]}
+                          numberOfLines={1}
+                        >
+                          {t.name}
+                        </Text>
+                      </View>
+                    ))}
+                  </ScrollView>
+                )}
+              </View>
+              {isMember ? (
+                <TouchableOpacity
+                  onPress={() => setSettingsModalVisible(true)}
+                  style={styles.settingsButton}
+                >
+                  <SlidersIcon size={24} color={colors.textSecondary} />
+                </TouchableOpacity>
+              ) : isPublicLeague ? (
+                <TouchableOpacity
+                  onPress={() => router.push(`/join-league/${id}`)}
+                  style={[styles.joinButton, { backgroundColor: colors.primary }]}
+                >
+                  <Text style={styles.joinButtonText}>Join</Text>
+                </TouchableOpacity>
+              ) : (
+                <View style={{ width: 40 }} />
+              )}
+          </View>
+        </View>
+
+      {/* Tabs */}
+      <View style={[styles.tabBar, { backgroundColor: colors.background }]}>
+        <TouchableOpacity
+          style={[styles.tab, { backgroundColor: colors.cardBackground, borderColor: colors.border }, activeTab === 'matchups' && { borderColor: colors.primary }]}
+          onPress={() => setActiveTab('matchups')}
+        >
+          <Text style={[styles.tabText, { color: colors.textSecondary }, activeTab === 'matchups' && { color: colors.text }]}>
+            Matchups
+          </Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={[styles.tab, { backgroundColor: colors.cardBackground, borderColor: colors.border }, activeTab === 'teams' && { borderColor: colors.primary }]}
+          onPress={() => setActiveTab('teams')}
+        >
+          <Text style={[styles.tabText, { color: colors.textSecondary }, activeTab === 'teams' && { color: colors.text }]}>
+            Teams
+          </Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={[styles.tab, { backgroundColor: colors.cardBackground, borderColor: colors.border }, activeTab === 'leaderboard' && { borderColor: colors.primary }]}
+          onPress={() => setActiveTab('leaderboard')}
+        >
+          <Text style={[styles.tabText, { color: colors.textSecondary }, activeTab === 'leaderboard' && { color: colors.text }]}>
+            Standings
+          </Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={[styles.tab, { backgroundColor: colors.cardBackground, borderColor: colors.border }, activeTab === 'drafts' && { borderColor: colors.primary }]}
+          onPress={() => setActiveTab('drafts')}
+        >
+          <Text style={[styles.tabText, { color: colors.textSecondary }, activeTab === 'drafts' && { color: colors.text }]}>
+            Drafts
+          </Text>
+        </TouchableOpacity>
+      </View>
+
+      {/* Tab Content */}
+      <ScrollView 
+        style={styles.content}
+        contentContainerStyle={{ paddingBottom: 400 }}
+        keyboardShouldPersistTaps="handled"
+        keyboardDismissMode="on-drag"
+        refreshControl={
+          <RefreshControl
+            refreshing={refreshing}
+            onRefresh={onRefresh}
+            tintColor={colors.primary}
+            colors={[colors.primary]}
+          />
+        }
+      >
+        {activeTab === 'matchups' && renderMatchupsTab()}
+        {activeTab === 'leaderboard' && renderLeaderboardTab()}
+        {activeTab === 'teams' && renderTeamsTab()}
+        {activeTab === 'drafts' && renderDraftsTab()}
+        
+        {/* Member Capacity Notification - Show when not at max capacity */}
+        {!loading && isOwner && league.status === 'open' && teams.length > 0 && teams.length < league.max_members && (
+          <View style={[styles.capacityNotification, { backgroundColor: colors.cardBackground, borderColor: colors.primary }]}>
+            <Text style={[styles.capacityTitle, { color: colors.text }]}>👥 Waiting for Members</Text>
+            <Text style={[styles.capacityText, { color: colors.textSecondary }]}>
+              {teams.length} of {league.max_members} members have joined. You need all {league.max_members} members to start the draft.
+            </Text>
+            <Text style={[styles.capacityHint, { color: colors.primary }]}>
+              💡 Tip: You can change the max members in league settings if you want to start sooner.
+            </Text>
+          </View>
+        )}
+
+        {/* High Picks Warning - Show when total picks > tournament players */}
+        {!warningDismissed && isOwner && league.status === 'open' && league.league_type === 'tournament' && tournamentPlayerCount > 0 && (
+          (() => {
+            const totalPicks = league.picks_per_person * league.max_members;
+            const picksPerPersonRatio = league.picks_per_person / tournamentPlayerCount;
+            
+            // Warn if total picks exceeds available players OR picks per person ratio > 1:5
+            if (totalPicks > tournamentPlayerCount || picksPerPersonRatio > 0.2) {
+              return (
+                <View style={styles.warningNotification}>
+                  <View style={styles.warningHeader}>
+                    <Text style={styles.warningTitle}>⚠️ Draft Configuration Warning</Text>
+                    <TouchableOpacity 
+                      onPress={() => setWarningDismissed(true)}
+                      style={styles.closeButton}
+                    >
+                      <Text style={styles.closeButtonText}>✕</Text>
+                    </TouchableOpacity>
+                  </View>
+                  {totalPicks > tournamentPlayerCount ? (
+                    <>
+                      <Text style={styles.warningText}>
+                        Total picks needed: {league.max_members} members × {league.picks_per_person} picks = {totalPicks} picks
+                      </Text>
+                      <Text style={styles.warningText}>
+                        Available players: {tournamentPlayerCount}
+                      </Text>
+                      <Text style={styles.warningText}>
+                        ⚠️ Not enough players! Members may be forced to pick fewer than {league.picks_per_person} players, or some members may not be able to draft at all.
+                      </Text>
+                    </>
+                  ) : (
+                    <>
+                      <Text style={styles.warningText}>
+                        Picks per person ({league.picks_per_person}) is high relative to tournament size ({tournamentPlayerCount} players).
+                      </Text>
+                      <Text style={styles.warningText}>
+                        This may cause teammates to face each other. Consider reducing picks per person in settings.
+                      </Text>
+                    </>
+                  )}
+                </View>
+              );
+            }
+            return null;
+          })()
+        )}
+
+      </ScrollView>
+
+      {/* Floating Chat Button */}
+      <TouchableOpacity
+        style={styles.floatingChatButton}
+        onPress={() => setChatModalVisible(true)}
+      >
+        <Svg width="32" height="32" viewBox="0 0 512 512">
+          <Path d="M448 32H64C46.3 32 32 46.3 32 64v288c0 17.7 14.3 32 32 32h96v84c0 9.8 11.2 15.5 19.1 9.7L304 384h144c17.7 0 32-14.3 32-32V64c0-17.7-14.3-32-32-32z" stroke={colors.primary} strokeWidth="32" fill="transparent"/>
+          <Path d="M384 160H128c-8.8 0-16-7.2-16-16s7.2-16 16-16h256c8.8 0 16 7.2 16 16s-7.2 16-16 16z" fill={colors.primary}/>
+          <Path d="M288 256H128c-8.8 0-16-7.2-16-16s7.2-16 16-16h160c8.8 0 16 7.2 16 16s-7.2 16-16 16z" fill={colors.primary}/>
+        </Svg>
+        {unreadCount > 0 && (
+          <View style={styles.unreadBadge}>
+            <Text style={styles.unreadBadgeText}>{unreadCount > 99 ? '99+' : unreadCount}</Text>
+          </View>
+        )}
+      </TouchableOpacity>
+    </Animated.View>
+
+    {/* Chat Modal */}
+    <Modal
+      visible={chatModalVisible}
+      animationType="slide"
+      onRequestClose={() => setChatModalVisible(false)}
+    >
+      <KeyboardAvoidingView
+        style={{ flex: 1, backgroundColor: colors.background }}
+        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+      >
+        <View style={[styles.chatModalHeader, { backgroundColor: colors.headerBackground, borderBottomColor: colors.border }]}>
+          <TouchableOpacity onPress={() => setChatModalVisible(false)}>
+            <Text style={[styles.chatModalClose, { color: colors.text }]}>✕</Text>
+          </TouchableOpacity>
+          <Text style={[styles.chatModalTitle, { color: colors.text }]}>League Chat</Text>
+          <TouchableOpacity 
+            onPress={toggleChatMute}
+            disabled={togglingMute}
+            style={styles.muteButton}
+          >
+            <Text style={styles.muteButtonText}>
+              {togglingMute ? '...' : (chatMuted ? '🔕' : '🔔')}
+            </Text>
+          </TouchableOpacity>
+        </View>
+        {renderChatTab()}
+      </KeyboardAvoidingView>
+    </Modal>
+
+    {/* Tournament Report Modal */}
+    <Modal
+      visible={reportModalVisible}
+      animationType="fade"
+      transparent={true}
+      onRequestClose={markReportViewed}
+    >
+      <View style={styles.reportModalOverlay}>
+        <View style={[styles.reportModalContainer, { backgroundColor: colors.cardBackground }]}>
+          <View style={[styles.reportModalHeader, { borderBottomColor: colors.border }]}>
+            <Text style={[styles.reportModalTitle, { color: colors.text }]}>🏆 {tournamentReport?.report_data?.tournament_name || 'Tournament'} has ended</Text>
+            <TouchableOpacity onPress={markReportViewed} style={styles.reportCloseButton}>
+              <Text style={[styles.reportCloseButtonText, { color: colors.textSecondary }]}>✕</Text>
+            </TouchableOpacity>
+          </View>
+
+          <ScrollView style={styles.reportModalContent}>
+            {tournamentReport && tournamentReport.report_data && (
+              <>
+                <Text style={[styles.reportSubtitle, { color: colors.text }]}>Final Standings</Text>
+                
+                {tournamentReport.report_data.final_standings?.map((standing: any, index: number) => (
+                  <View 
+                    key={standing.user_id} 
+                    style={[
+                      styles.standingRow,
+                      { backgroundColor: colors.background },
+                      standing.user_id === user?.id && { ...styles.standingRowHighlight, backgroundColor: colors.primary + '20', borderColor: colors.primary }
+                    ]}
+                  >
+                    <View style={styles.standingRank}>
+                      {standing.rank === 1 && <Text style={styles.rankEmoji}>🥇</Text>}
+                      {standing.rank === 2 && <Text style={styles.rankEmoji}>🥈</Text>}
+                      {standing.rank === 3 && <Text style={styles.rankEmoji}>🥉</Text>}
+                      {standing.rank > 3 && <Text style={[styles.rankNumber, { color: colors.textSecondary }]}>#{standing.rank}</Text>}
+                    </View>
+                    
+                    <View style={styles.standingInfo}>
+                      <Text style={[styles.standingUsername, { color: colors.text }]}>
+                        {standing.username}
+                        {standing.user_id === user?.id && ' (You)'}
+                      </Text>
+                      <Text style={[styles.standingStats, { color: colors.textSecondary }]}>
+                        {standing.wins || 0}W - {standing.losses || 0}L - {standing.draws || 0}D
+                      </Text>
+                    </View>
+                    
+                    <Text style={[styles.standingPoints, { color: colors.primary }]}>
+                      {standing.total_points.toFixed(1)}
+                    </Text>
+                  </View>
+                ))}
+
+                <View style={[styles.reportFooter, { backgroundColor: colors.background }]}>
+                  <Text style={[styles.reportFooterText, { color: colors.textSecondary }]}>
+                    {(() => {
+                      const userStanding = tournamentReport.report_data.final_standings?.find((s: any) => s.user_id === user?.id);
+                      const totalTeams = tournamentReport.report_data.total_teams || tournamentReport.report_data.final_standings?.length || 0;
+                      if (userStanding) {
+                        return `You placed ${userStanding.rank} out of ${totalTeams}. Well done and good luck on the next tournament!`;
+                      }
+                      return 'Well done and good luck on the next tournament!';
+                    })()}
+                  </Text>
+                </View>
+              </>
+            )}
+          </ScrollView>
+
+          <TouchableOpacity 
+            style={[styles.reportDismissButton, { backgroundColor: colors.primary }]}
+            onPress={markReportViewed}
+          >
+            <Text style={styles.reportDismissButtonText}>Continue</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    </Modal>
+
+    {/* Welcome Modal for New Members */}
+    <Modal
+      visible={welcomeModalVisible}
+      transparent={true}
+      animationType="fade"
+      onRequestClose={() => setWelcomeModalVisible(false)}
+    >
+      <View style={styles.modalOverlay}>
+        <View style={styles.welcomeModalContainer}>
+          <Text style={styles.welcomeModalIcon}>👋</Text>
+          <Text style={styles.welcomeModalTitle}>
+            Welcome to {league?.name}!
+          </Text>
+          <Text style={styles.welcomeModalMessage}>
+            You'll participate starting with the next tournament draft.
+          </Text>
+          <TouchableOpacity
+            style={styles.welcomeModalButton}
+            onPress={() => setWelcomeModalVisible(false)}
+          >
+            <Text style={styles.welcomeModalButtonText}>Got it!</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    </Modal>
+
+    {/* Season Info Modal */}
+    <Modal
+      visible={seasonInfoModalVisible}
+      transparent={true}
+      animationType="fade"
+      onRequestClose={() => setSeasonInfoModalVisible(false)}
+    >
+      <View style={styles.modalOverlay}>
+        <View style={styles.welcomeModalContainer}>
+          <Text style={styles.welcomeModalIcon}>🏆</Text>
+          <Text style={styles.welcomeModalTitle}>
+            2026 Season
+          </Text>
+          <Text style={styles.welcomeModalMessage}>
+            Track performance of top FIDE players throughout the year including the Candidates Tournament, World Championships, and major FIDE tournaments.
+          </Text>
+          <TouchableOpacity
+            style={styles.welcomeModalButton}
+            onPress={() => setSeasonInfoModalVisible(false)}
+          >
+            <Text style={styles.welcomeModalButtonText}>Got it!</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    </Modal>
+
+    {/* Schedule Draft Modal */}
+    <Modal
+      visible={scheduleModalVisible}
+      transparent={true}
+      animationType="fade"
+      onRequestClose={() => setScheduleModalVisible(false)}
+    >
+      <View style={styles.modalOverlay}>
+        <View style={[styles.scheduleModalContainer, { backgroundColor: colors.cardBackground }]}>
+          <Text style={[styles.scheduleModalTitle, { color: colors.text }]}>
+            Schedule Draft for {schedulingTournamentName}
+          </Text>
+          
+          <TouchableOpacity
+            style={[styles.dateTimeButton, { backgroundColor: colors.background, borderColor: colors.border }]}
+            onPress={() => setShowDatePicker(true)}
+          >
+            <Text style={[styles.dateTimeButtonLabel, { color: colors.textSecondary }]}>Date</Text>
+            <Text style={[styles.dateTimeButtonValue, { color: colors.text }]}>
+              {scheduledDate.toLocaleDateString()}
+            </Text>
+          </TouchableOpacity>
+
+          {showDatePicker && (
+            <DateTimePicker
+              value={scheduledDate}
+              mode="date"
+              display="default"
+              minimumDate={new Date()}
+              onChange={(event, selectedDate) => {
+                setShowDatePicker(false);
+                if (selectedDate) {
+                  setScheduledDate(selectedDate);
+                }
+              }}
+            />
+          )}
+
+          <TouchableOpacity
+            style={[styles.dateTimeButton, { backgroundColor: colors.background, borderColor: colors.border }]}
+            onPress={() => setShowTimePicker(true)}
+          >
+            <Text style={[styles.dateTimeButtonLabel, { color: colors.textSecondary }]}>Time</Text>
+            <Text style={[styles.dateTimeButtonValue, { color: colors.text }]}>
+              {scheduledTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+            </Text>
+          </TouchableOpacity>
+
+          {showTimePicker && (
+            <DateTimePicker
+              value={scheduledTime}
+              mode="time"
+              display="default"
+              onChange={(event, selectedTime) => {
+                setShowTimePicker(false);
+                if (selectedTime) {
+                  setScheduledTime(selectedTime);
+                }
+              }}
+            />
+          )}
+
+          <View style={styles.scheduleModalButtons}>
+            <TouchableOpacity
+              style={[styles.scheduleModalButton, styles.cancelButton, { borderColor: colors.border }]}
+              onPress={() => setScheduleModalVisible(false)}
+            >
+              <Text style={[styles.cancelButtonText, { color: colors.text }]}>Cancel</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.scheduleModalButton, styles.confirmButton, { backgroundColor: colors.primary }]}
+              onPress={scheduleDraft}
+            >
+              <Text style={styles.confirmButtonText}>Schedule</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </View>
+    </Modal>
+
+    {/* Player Profile Modal */}
+    <PlayerProfileModal
+      visible={playerModalVisible}
+      player={selectedPlayer}
+      onClose={() => setPlayerModalVisible(false)}
+    />
+
+    {/* League Settings Modal */}
+    <LeagueSettingsModal
+      visible={settingsModalVisible}
+      leagueId={id as string}
+      onClose={() => setSettingsModalVisible(false)}
+    />
+    </View>
+  );
+}

@@ -2,28 +2,86 @@
   "expo": {
     "name": "Fantasy Chess",
     "slug": "fantasy-chess-mobile",
-    "version": "1.0.0",
+    "version": "1.0.7",
     "orientation": "portrait",
     "userInterfaceStyle": "dark",
+    "icon": "./assets/icon.png",
     "splash": {
+      "image": "./assets/splash.png",
       "resizeMode": "contain",
       "backgroundColor": "#0f172a"
     },
+    "jsEngine": "hermes",
     "assetBundlePatterns": [
       "**/*"
     ],
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.fantasychess.mobile"
+      "bundleIdentifier": "com.fantasychess.mobile",
+      "buildNumber": "21",
+      "infoPlist": {
+        "NSCameraUsageDescription": "This app does not use the camera",
+        "NSMicrophoneUsageDescription": "This app does not use the microphone",
+        "ITSAppUsesNonExemptEncryption": false
+      },
+      "associatedDomains": [
+        "applinks:thefantasychess.com",
+        "applinks:www.thefantasychess.com"
+      ],
+      "config": {
+        "usesNonExemptEncryption": false
+      }
     },
+    "privacy": "https://thefantasychess.com/privacy-policy.html",
     "android": {
-      "package": "com.fantasychess.mobile"
+      "package": "com.fantasychess.mobile",
+      "versionCode": 12,
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#0f172a"
+      },
+      "permissions": [
+        "INTERNET",
+        "ACCESS_NETWORK_STATE"
+      ],
+      "intentFilters": [
+        {
+          "action": "VIEW",
+          "autoVerify": true,
+          "data": [
+            {
+              "scheme": "https",
+              "host": "thefantasychess.com",
+              "pathPrefix": "/accept-invite"
+            },
+            {
+              "scheme": "https",
+              "host": "www.thefantasychess.com",
+              "pathPrefix": "/accept-invite"
+            }
+          ],
+          "category": [
+            "BROWSABLE",
+            "DEFAULT"
+          ]
+        }
+      ]
     },
-    "web": {
-    },
+    "web": {},
     "scheme": "fantasychess",
     "plugins": [
-      "expo-router"
-    ]
+      "expo-router",
+      "expo-font",
+      "expo-web-browser"
+    ],
+    "extra": {
+      "router": {
+        "origin": false
+      },
+      "eas": {
+        "projectId": "3c806ee6-19c7-4fa4-a3c9-4e34e73e0b5a"
+      }
+    },
+    "owner": "kushfantasy"
   }
 }

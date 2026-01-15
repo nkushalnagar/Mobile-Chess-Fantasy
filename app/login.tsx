@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   View,
   Text,
@@ -11,13 +11,26 @@ import {
 } from 'react-native';
 import { useRouter } from 'expo-router';
 import { useAuth } from '@/contexts/AuthContext';
+import GoogleSignInButton from '@/components/GoogleSignInButton';
+import * as AppleAuthentication from 'expo-apple-authentication';
 
 export default function LoginScreen() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
+  const [googleLoading, setGoogleLoading] = useState(false);
+  const [appleLoading, setAppleLoading] = useState(false);
+  const [appleAuthAvailable, setAppleAuthAvailable] = useState(false);
   const router = useRouter();
-  const { signIn } = useAuth();
+  const { signIn, signInWithGoogle, signInWithApple } = useAuth();
+
+  useEffect(() => {
+    const checkAppleAuth = async () => {
+      const isAvailable = await AppleAuthentication.isAvailableAsync();
+      setAppleAuthAvailable(isAvailable);
+    };
+    checkAppleAuth();
+  }, []);
 
   const handleLogin = async () => {
     if (!email || !password) {
@@ -30,9 +43,37 @@ export default function LoginScreen() {
       await signIn(email, password);
       router.replace('/(tabs)');
     } catch (error: any) {
-      Alert.alert('Error', error.message || 'Failed to sign in');
+      const errorMessage = error.message || 'Failed to sign in';
+      const hint = errorMessage.includes('Username not found') 
+        ? '\n\nTip: Try signing in with your email address instead.'
+        : '';
+      Alert.alert('Error', errorMessage + hint);
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleGoogleSignIn = async () => {
+    setGoogleLoading(true);
+    try {
+      await signInWithGoogle();
+      router.replace('/(tabs)');
+    } catch (error: any) {
+      Alert.alert('Error', error.message || 'Failed to sign in with Google');
+    } finally {
+      setGoogleLoading(false);
+    }
+  };
+
+  const handleAppleSignIn = async () => {
+    setAppleLoading(true);
+    try {
+      await signInWithApple();
+      router.replace('/(tabs)');
+    } catch (error: any) {
+      Alert.alert('Error', error.message || 'Failed to sign in with Apple');
+    } finally {
+      setAppleLoading(false);
     }
   };
 
@@ -48,12 +89,11 @@ export default function LoginScreen() {
         <View style={styles.form}>
           <TextInput
             style={styles.input}
-            placeholder="Email"
+            placeholder="Email or Username"
             placeholderTextColor="#64748b"
             value={email}
             onChangeText={setEmail}
             autoCapitalize="none"
-            keyboardType="email-address"
           />
 
           <TextInput
@@ -74,6 +114,32 @@ export default function LoginScreen() {
               {loading ? 'Signing in...' : 'Sign In'}
             </Text>
           </TouchableOpacity>
+
+          <TouchableOpacity onPress={() => router.push('/forgot-password')}>
+            <Text style={styles.forgotPasswordText}>Forgot Password?</Text>
+          </TouchableOpacity>
+
+          <View style={styles.divider}>
+            <View style={styles.dividerLine} />
+            <Text style={styles.dividerText}>OR</Text>
+            <View style={styles.dividerLine} />
+          </View>
+
+          <GoogleSignInButton
+            onPress={handleGoogleSignIn}
+            disabled={googleLoading}
+            loading={googleLoading}
+          />
+
+          {appleAuthAvailable && (
+            <AppleAuthentication.AppleAuthenticationButton
+              buttonType={AppleAuthentication.AppleAuthenticationButtonType.SIGN_IN}
+              buttonStyle={AppleAuthentication.AppleAuthenticationButtonStyle.BLACK}
+              cornerRadius={12}
+              style={styles.appleButton}
+              onPress={handleAppleSignIn}
+            />
+          )}
 
           <TouchableOpacity onPress={() => router.push('/signup')}>
             <Text style={styles.linkText}>
@@ -101,11 +167,13 @@ const styles = StyleSheet.create({
     fontWeight: 'bold',
     color: '#fff',
     marginBottom: 8,
+    fontFamily: 'Montserrat-Bold',
   },
   subtitle: {
     fontSize: 16,
     color: '#94a3b8',
     marginBottom: 32,
+    fontFamily: 'Montserrat-Bold',
   },
   form: {
     gap: 16,
@@ -118,6 +186,7 @@ const styles = StyleSheet.create({
     color: '#fff',
     borderWidth: 1,
     borderColor: '#334155',
+    fontFamily: 'Montserrat-Bold',
   },
   button: {
     backgroundColor: '#2563eb',
@@ -133,14 +202,56 @@ const styles = StyleSheet.create({
     color: '#fff',
     fontSize: 16,
     fontWeight: 'bold',
+    fontFamily: 'Montserrat-Bold',
+  },
+  forgotPasswordText: {
+    color: '#2563eb',
+    textAlign: 'center',
+    marginTop: 8,
+    fontFamily: 'Montserrat-Bold',
   },
   linkText: {
     color: '#94a3b8',
     textAlign: 'center',
     marginTop: 8,
+    fontFamily: 'Montserrat-Bold',
   },
   linkBold: {
     color: '#2563eb',
     fontWeight: 'bold',
+    fontFamily: 'Montserrat-Bold',
+  },
+  divider: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginVertical: 16,
+  },
+  dividerLine: {
+    flex: 1,
+    height: 1,
+    backgroundColor: '#334155',
+  },
+  dividerText: {
+    color: '#64748b',
+    paddingHorizontal: 16,
+    fontFamily: 'Montserrat-Bold',
+  },
+  googleButton: {
+    backgroundColor: '#fff',
+    borderRadius: 12,
+    padding: 16,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#e2e8f0',
+  },
+  googleButtonText: {
+    color: '#1e293b',
+    fontSize: 16,
+    fontWeight: 'bold',
+    fontFamily: 'Montserrat-Bold',
+  },
+  appleButton: {
+    width: '100%',
+    height: 50,
   },
 });

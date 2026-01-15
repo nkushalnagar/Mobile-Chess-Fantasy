@@ -1,43 +1,62 @@
 import { Tabs } from 'expo-router';
 import { Text, Image, View, StyleSheet, TouchableOpacity, Modal, Pressable } from 'react-native';
 import { useRouter } from 'expo-router';
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { useAuth } from '@/contexts/AuthContext';
+import { useTheme } from '@/contexts/ThemeContext';
 import { supabase } from '@/lib/supabase';
 
 export default function TabLayout() {
   const router = useRouter();
   const { profile } = useAuth();
+  const { colors } = useTheme();
   const [menuVisible, setMenuVisible] = useState(false);
   const [notificationCount, setNotificationCount] = useState(0);
   const pawnColor = (profile as any)?.pawn_color || '#2563eb';
 
   // Fetch notification count
   useEffect(() => {
-    if (!profile?.username) return;
+    if (!profile?.id) return;
 
     const loadNotificationCount = async () => {
       try {
-        const { data, error, count } = await supabase
-          .from('league_invites')
-          .select('*', { count: 'exact', head: true })
-          .eq('invitee_username', profile.username)
-          .eq('status', 'pending');
+        // Get unread notification count from new notifications table
+        const { data, error } = await supabase
+          .rpc('get_unread_notification_count', { p_user_id: profile.id });
 
         if (error) throw error;
-        setNotificationCount(count || 0);
+        setNotificationCount(data || 0);
       } catch (error) {
         console.error('Error loading notification count:', error);
       }
     };
 
     loadNotificationCount();
-    const interval = setInterval(loadNotificationCount, 30000); // Poll every 30s
-    return () => clearInterval(interval);
+    
+    // Subscribe to real-time updates
+    const channel = supabase
+      .channel('notification_count')
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'notifications',
+          filter: `user_id=eq.${profile.id}`,
+        },
+        () => {
+          loadNotificationCount();
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
   }, [profile]);
 
   const menuItems = [
-    { label: 'Notifications', route: '/notifications', icon: '🔔' },
+    { label: 'Notifications', route: '/notifications?from=home', icon: '🔔' },
     { label: 'Leagues', route: '/(tabs)/leagues', icon: '🏆' },
     { label: 'Profile', route: '/(tabs)/profile', icon: '👤' },
   ];
@@ -45,16 +64,16 @@ export default function TabLayout() {
   return (
     <Tabs
       screenOptions={{
-        tabBarActiveTintColor: '#2563eb',
-        tabBarInactiveTintColor: '#64748b',
+        tabBarActiveTintColor: colors.primary,
+        tabBarInactiveTintColor: colors.textTertiary,
         tabBarStyle: {
-          backgroundColor: '#1e293b',
-          borderTopColor: '#334155',
+          backgroundColor: colors.cardBackground,
+          borderTopColor: colors.border,
         },
         headerStyle: {
-          backgroundColor: '#0f172a',
+          backgroundColor: colors.headerBackground,
         },
-        headerTintColor: '#fff',
+        headerTintColor: colors.text,
         headerTitleStyle: {
           fontFamily: 'Montserrat-Bold',
           fontSize: 20,
@@ -72,7 +91,7 @@ export default function TabLayout() {
                 style={styles.headerLogo}
                 resizeMode="contain"
               />
-              <Text style={styles.headerText}>Fantasy Chess</Text>
+              <Text style={[styles.headerText, { color: colors.text }]}>Fantasy Chess</Text>
             </View>
           ),
           headerRight: () => (
@@ -82,9 +101,9 @@ export default function TabLayout() {
                 onPress={() => setMenuVisible(true)}
               >
                 <View style={styles.hamburger}>
-                  <View style={styles.hamburgerLine} />
-                  <View style={styles.hamburgerLine} />
-                  <View style={styles.hamburgerLine} />
+                  <View style={[styles.hamburgerLine, { backgroundColor: colors.text }]} />
+                  <View style={[styles.hamburgerLine, { backgroundColor: colors.text }]} />
+                  <View style={[styles.hamburgerLine, { backgroundColor: colors.text }]} />
                 </View>
               </TouchableOpacity>
               <Modal
@@ -94,10 +113,10 @@ export default function TabLayout() {
                 onRequestClose={() => setMenuVisible(false)}
               >
                 <Pressable
-                  style={styles.modalOverlay}
+                  style={[styles.modalOverlay, { backgroundColor: colors.modalOverlay }]}
                   onPress={() => setMenuVisible(false)}
                 >
-                  <View style={styles.menuDrawer}>
+                  <View style={[styles.menuDrawer, { backgroundColor: colors.cardBackground }]}>
                     {menuItems.map((item, index) => (
                       <TouchableOpacity
                         key={index}
@@ -116,7 +135,7 @@ export default function TabLayout() {
                         ) : (
                           <Text style={styles.menuIcon}>{item.icon}</Text>
                         )}
-                        <Text style={styles.menuLabel}>{item.label}</Text>
+                        <Text style={[styles.menuLabel, { color: colors.text }]}>{item.label}</Text>
                       </TouchableOpacity>
                     ))}
                   </View>
@@ -125,10 +144,10 @@ export default function TabLayout() {
             </>
           ),
           tabBarLabel: 'Home',
-          tabBarIcon: () => (
+          tabBarIcon: ({ focused }) => (
             <Image
               source={require('@/assets/images/logo.png')}
-              style={{ width: 28, height: 28 }}
+              style={{ width: 28, height: 28, opacity: focused ? 1 : 0.6 }}
               resizeMode="contain"
             />
           ),
@@ -141,7 +160,7 @@ export default function TabLayout() {
           headerRight: () => (
             <TouchableOpacity
               style={styles.notificationButton}
-              onPress={() => router.push('/notifications')}
+              onPress={() => router.push('/notifications?from=leagues')}
             >
               <Text style={styles.bellIcon}>🔔</Text>
               {notificationCount > 0 && (
@@ -160,7 +179,11 @@ export default function TabLayout() {
         options={{
           title: 'Results',
           tabBarLabel: 'Results',
-          tabBarIcon: () => <Text style={{ fontSize: 14, fontWeight: 'bold' }}>1:0</Text>,
+          tabBarIcon: ({ focused }) => (
+            <Text style={{ fontSize: 14, fontWeight: 'bold', color: focused ? colors.primary : '#60a5fa' }}>
+              1:0
+            </Text>
+          ),
         }}
       />
       <Tabs.Screen

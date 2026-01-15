@@ -9,9 +9,23 @@ import {
   Alert,
   ActivityIndicator,
 } from 'react-native';
-import { useRouter } from 'expo-router';
+import { useRouter, useLocalSearchParams } from 'expo-router';
 import { supabase } from '@/lib/supabase';
 import { useAuth } from '@/contexts/AuthContext';
+import { useTheme } from '@/contexts/ThemeContext';
+import SkeletonLoader from '@/components/SkeletonLoader';
+
+interface Notification {
+  id: string;
+  title: string;
+  body: string;
+  notification_type: string;
+  league_id?: string;
+  trade_id?: string;
+  data?: any;
+  is_read: boolean;
+  created_at: string;
+}
 
 interface LeagueInvite {
   id: string;
@@ -26,19 +40,42 @@ interface LeagueInvite {
 }
 
 export default function NotificationsScreen() {
+  const [notifications, setNotifications] = useState<Notification[]>([]);
   const [invites, setInvites] = useState<LeagueInvite[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  const [showAll, setShowAll] = useState(false);
   const router = useRouter();
+  const { from } = useLocalSearchParams();
   const { user, profile } = useAuth();
+  const { colors } = useTheme();
 
   const loadInvites = useCallback(async () => {
-    if (!profile?.username) {
+    if (!profile?.username || !user) {
       setLoading(false);
       return;
     }
 
     try {
+      // Load notifications - show unread + recent read (last 7 days) or all if showAll is true
+      // Exclude league_invite notifications since pending invites are shown separately with action buttons
+      let query = supabase
+        .from('notifications')
+        .select('*')
+        .eq('user_id', user.id)
+        .neq('notification_type', 'league_invite')
+        .order('created_at', { ascending: false });
+
+      if (!showAll) {
+        // Only show unread notifications
+        query = query.eq('is_read', false);
+      }
+
+      const { data: notifData, error: notifError } = await query.limit(50);
+
+      if (notifError) throw notifError;
+      setNotifications(notifData || []);
+
       // Get only pending invites
       const { data: invites, error: invitesError } = await supabase
         .from('league_invites')
@@ -99,11 +136,32 @@ export default function NotificationsScreen() {
       setLoading(false);
       setRefreshing(false);
     }
-  }, [profile]);
+  }, [profile, showAll]);
 
   useEffect(() => {
     loadInvites();
-  }, [loadInvites]);
+
+    // Subscribe to new notifications
+    const channel = supabase
+      .channel('notifications')
+      .on(
+        'postgres_changes',
+        {
+          event: 'INSERT',
+          schema: 'public',
+          table: 'notifications',
+          filter: `user_id=eq.${user?.id}`,
+        },
+        () => {
+          loadInvites();
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [loadInvites, user, showAll]);
 
   const onRefresh = () => {
     setRefreshing(true);
@@ -115,6 +173,25 @@ export default function NotificationsScreen() {
 
     try {
       if (accept) {
+        // Check if league is at max capacity
+        const { data: leagueData, error: leagueError } = await supabase
+          .from('leagues')
+          .select('max_members')
+          .eq('id', leagueId)
+          .single();
+
+        if (leagueError) throw leagueError;
+
+        const { count: memberCount } = await supabase
+          .from('league_memberships')
+          .select('*', { count: 'exact' })
+          .eq('league_id', leagueId);
+
+        if (memberCount && leagueData && memberCount >= leagueData.max_members) {
+          Alert.alert('Error', 'This league is at maximum capacity and cannot accept new members.');
+          return;
+        }
+
         // Create league membership
         const { error: membershipError } = await supabase
           .from('league_memberships')
@@ -157,16 +234,142 @@ export default function NotificationsScreen() {
     }
   };
 
+  const handleNotificationTap = async (notification: Notification) => {
+    // Mark as read
+    await supabase
+      .from('notifications')
+      .update({ is_read: true, read_at: new Date().toISOString() })
+      .eq('id', notification.id);
+
+    // Navigate based on notification type
+    switch (notification.notification_type) {
+      case 'league_invite':
+        // Stay on notifications page to handle invite
+        break;
+      case 'draft_starting':
+        if (notification.league_id) {
+          router.push(`/draft-room/${notification.league_id}`);
+        }
+        break;
+      case 'chat_message':
+        if (notification.league_id) {
+          router.push(`/league/${notification.league_id}?tab=chat`);
+        }
+        break;
+      case 'trade_request':
+      case 'trade_accepted':
+      case 'trade_rejected':
+        if (notification.league_id) {
+          router.push(`/league/${notification.league_id}`);
+        }
+        break;
+      case 'tournament_starting':
+        // Navigate to tournament when implemented
+        if (notification.league_id) {
+          router.push(`/league/${notification.league_id}`);
+        }
+        break;
+      case 'league_settings_changed':
+        if (notification.league_id) {
+          router.push(`/league/${notification.league_id}`);
+        }
+        break;
+      case 'league_invite_accepted':
+        if (notification.league_id) {
+          router.push(`/league/${notification.league_id}`);
+        }
+        break;
+      default:
+        if (notification.league_id) {
+          router.push(`/league/${notification.league_id}`);
+        }
+    }
+
+    // Refresh to update read status
+    loadInvites();
+  };
+
+  const handleClearNotifications = async () => {
+    if (!user?.id) return;
+
+    Alert.alert(
+      'Clear Notifications',
+      'This will clear all notifications except league invites. Are you sure?',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Clear',
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              // Delete all notifications except league invites
+              const { error } = await supabase
+                .from('notifications')
+                .delete()
+                .eq('user_id', user.id)
+                .neq('notification_type', 'league_invite');
+
+              if (error) throw error;
+
+              // Refresh notifications
+              loadInvites();
+              Alert.alert('Success', 'Notifications cleared');
+            } catch (error) {
+              console.error('Error clearing notifications:', error);
+              Alert.alert('Error', 'Failed to clear notifications');
+            }
+          },
+        },
+      ]
+    );
+  };
+
+  const renderNotification = ({ item }: { item: Notification }) => {
+    const getIcon = (type: string) => {
+      switch (type) {
+        case 'league_invite': return '📨';
+        case 'draft_starting': return '🎯';
+        case 'chat_message': return '💬';
+        case 'trade_request': return '🔄';
+        case 'trade_accepted': return '✅';
+        case 'trade_rejected': return '❌';
+        case 'tournament_starting': return '🏆';
+        case 'player_scored': return '⭐';
+        case 'news_story': return '📰';
+        case 'league_settings_changed': return '⚙️';
+        case 'league_invite_accepted': return '👋';
+        default: return '🔔';
+      }
+    };
+
+    return (
+      <TouchableOpacity
+        style={[styles.notificationCard, { backgroundColor: colors.cardBackground, borderColor: colors.border }, !item.is_read && { borderColor: colors.primary }]}
+        onPress={() => handleNotificationTap(item)}
+      >
+        <View style={styles.notificationHeader}>
+          <Text style={styles.notificationIcon}>{getIcon(item.notification_type)}</Text>
+          <View style={styles.notificationContent}>
+            <Text style={[styles.notificationTitle, { color: colors.text }]}>{item.title}</Text>
+            <Text style={[styles.notificationBody, { color: colors.textSecondary }]}>{item.body}</Text>
+            <Text style={[styles.notificationDate, { color: colors.textTertiary }]}>
+              {new Date(item.created_at).toLocaleDateString()} at {new Date(item.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+            </Text>
+          </View>
+          {!item.is_read && <View style={[styles.unreadDot, { backgroundColor: colors.primary }]} />}
+        </View>
+      </TouchableOpacity>
+    );
+  };
+
   const renderInvite = ({ item }: { item: LeagueInvite }) => (
-    <View style={styles.inviteCard}>
+    <View style={[styles.inviteCard, { backgroundColor: colors.cardBackground, borderColor: colors.border }]}>
       <View style={styles.inviteHeader}>
-        <Text style={styles.inviteTitle}>League Invite</Text>
-        <Text style={styles.inviteDate}>
+        <Text style={[styles.inviteTitle, { color: colors.text }]}>League Invite</Text>
+        <Text style={[styles.inviteDate, { color: colors.textTertiary }]}>
           {new Date(item.created_at).toLocaleDateString()}
         </Text>
       </View>
-      <Text style={styles.leagueName}>{item.league.name}</Text>
-      <Text style={styles.inviteFrom}>From {item.league.owner.username}</Text>
       <View style={styles.buttonRow}>
         <TouchableOpacity
           style={[styles.button, styles.declineButton]}
@@ -181,42 +384,81 @@ export default function NotificationsScreen() {
           <Text style={styles.acceptButtonText}>Accept</Text>
         </TouchableOpacity>
       </View>
+      <Text style={[styles.leagueName, { color: colors.text }]}>{item.league.name}</Text>
+      <Text style={[styles.inviteFrom, { color: colors.textSecondary }]}>From {item.league.owner.username}</Text>
     </View>
   );
 
   if (loading) {
     return (
-      <View style={styles.centerContent}>
-        <ActivityIndicator size="large" color="#2563eb" />
-        <Text style={styles.loadingText}>Loading notifications...</Text>
+      <View style={[styles.container, { backgroundColor: colors.background }]}>
+        <View style={[styles.header, { backgroundColor: colors.headerBackground, borderBottomColor: colors.border }]}>
+          <TouchableOpacity onPress={() => {
+            if (from === 'leagues') {
+              router.push('/(tabs)/leagues');
+            } else if (from === 'profile') {
+              router.push('/(tabs)/profile');
+            } else {
+              router.push('/(tabs)/home');
+            }
+          }} style={styles.backButton}>
+            <Text style={[styles.backButtonText, { color: colors.text }]}>←</Text>
+          </TouchableOpacity>
+          <Text style={[styles.headerTitle, { color: colors.text }]}>Notifications</Text>
+          <View style={styles.headerSpacer} />
+        </View>
+        <SkeletonLoader type="card" count={6} />
       </View>
     );
   }
 
   return (
-    <View style={styles.container}>
+    <View style={[styles.container, { backgroundColor: colors.background }]}>
       {/* Header with Back Button */}
-      <View style={styles.header}>
-        <TouchableOpacity onPress={() => router.back()} style={styles.backButton}>
-          <Text style={styles.backButtonText}>←</Text>
+      <View style={[styles.header, { backgroundColor: colors.headerBackground, borderBottomColor: colors.border }]}>
+        <TouchableOpacity onPress={() => {
+          if (from === 'leagues') {
+            router.push('/(tabs)/leagues');
+          } else if (from === 'profile') {
+            router.push('/(tabs)/profile');
+          } else {
+            router.push('/(tabs)/home');
+          }
+        }} style={styles.backButton}>
+          <Text style={[styles.backButtonText, { color: colors.text }]}>←</Text>
         </TouchableOpacity>
-        <Text style={styles.headerTitle}>Notifications</Text>
-        <View style={styles.headerSpacer} />
+        <Text style={[styles.headerTitle, { color: colors.text }]}>Notifications</Text>
+        {(notifications.length > 0 || invites.length > 0) && (
+          <TouchableOpacity 
+            onPress={handleClearNotifications}
+            style={styles.clearButton}
+          >
+            <Text style={[styles.clearButtonText, { color: colors.primary }]}>Clear</Text>
+          </TouchableOpacity>
+        )}
+        {!(notifications.length > 0 || invites.length > 0) && <View style={styles.headerSpacer} />}
       </View>
 
-      {invites.length === 0 ? (
+      {notifications.length === 0 && invites.length === 0 ? (
         <View style={styles.centerContent}>
           <Text style={styles.emptyTitle}>📬</Text>
-          <Text style={styles.emptyText}>No pending notifications</Text>
+          <Text style={[styles.emptyText, { color: colors.textSecondary }]}>No notifications</Text>
         </View>
       ) : (
         <FlatList
-          data={invites}
-          renderItem={renderInvite}
-          keyExtractor={(item) => item.id}
+          data={[
+            ...invites.map(i => ({ type: 'invite', data: i })),
+            ...notifications.map(n => ({ type: 'notification', data: n }))
+          ]}
+          renderItem={({ item }) => 
+            item.type === 'notification' 
+              ? renderNotification({ item: item.data as Notification })
+              : renderInvite({ item: item.data as LeagueInvite })
+          }
+          keyExtractor={(item) => `${item.type}-${item.data.id}`}
           contentContainerStyle={styles.listContent}
           refreshControl={
-            <RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor="#2563eb" />
+            <RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={colors.primary} />
           }
         />
       )}
@@ -258,6 +500,13 @@ const styles = StyleSheet.create({
   headerSpacer: {
     width: 40, // Same width as back button for centering
   },
+  clearButton: {
+    padding: 8,
+  },
+  clearButtonText: {
+    fontSize: 14,
+    fontWeight: '600',
+  },
   centerContent: {
     flex: 1,
     justifyContent: 'center',
@@ -265,7 +514,6 @@ const styles = StyleSheet.create({
     padding: 20,
   },
   loadingText: {
-    color: '#94a3b8',
     fontSize: 16,
     marginTop: 12,
   },
@@ -310,15 +558,16 @@ const styles = StyleSheet.create({
     fontWeight: 'bold',
     color: '#fff',
     marginBottom: 4,
+    marginTop: 16,
   },
   inviteFrom: {
     fontSize: 14,
     color: '#94a3b8',
-    marginBottom: 16,
   },
   buttonRow: {
     flexDirection: 'row',
     gap: 12,
+    marginBottom: 16,
   },
   button: {
     flex: 1,
@@ -343,5 +592,51 @@ const styles = StyleSheet.create({
     color: '#fff',
     fontSize: 14,
     fontWeight: '600',
+  },
+  notificationCard: {
+    backgroundColor: '#1e293b',
+    borderRadius: 12,
+    padding: 16,
+    marginBottom: 12,
+    borderWidth: 1,
+    borderColor: '#334155',
+  },
+  unreadCard: {
+    borderColor: '#2563eb',
+    backgroundColor: '#1e2a3b',
+  },
+  notificationHeader: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 12,
+  },
+  notificationIcon: {
+    fontSize: 24,
+  },
+  notificationContent: {
+    flex: 1,
+  },
+  notificationTitle: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#fff',
+    marginBottom: 4,
+  },
+  notificationBody: {
+    fontSize: 14,
+    color: '#94a3b8',
+    marginBottom: 8,
+    lineHeight: 20,
+  },
+  notificationDate: {
+    fontSize: 12,
+    color: '#64748b',
+  },
+  unreadDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: '#2563eb',
+    marginTop: 4,
   },
 });

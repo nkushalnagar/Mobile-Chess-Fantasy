@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   View,
   Text,
@@ -12,6 +12,8 @@ import {
 } from 'react-native';
 import { useRouter } from 'expo-router';
 import { useAuth } from '@/contexts/AuthContext';
+import GoogleSignInButton from '@/components/GoogleSignInButton';
+import * as AppleAuthentication from 'expo-apple-authentication';
 
 export default function SignupScreen() {
   const [email, setEmail] = useState('');
@@ -19,8 +21,19 @@ export default function SignupScreen() {
   const [confirmPassword, setConfirmPassword] = useState('');
   const [username, setUsername] = useState('');
   const [loading, setLoading] = useState(false);
+  const [googleLoading, setGoogleLoading] = useState(false);
+  const [appleLoading, setAppleLoading] = useState(false);
+  const [appleAuthAvailable, setAppleAuthAvailable] = useState(false);
   const router = useRouter();
-  const { signUp } = useAuth();
+  const { signUp, signInWithGoogle, signInWithApple } = useAuth();
+
+  useEffect(() => {
+    const checkAppleAuth = async () => {
+      const isAvailable = await AppleAuthentication.isAvailableAsync();
+      setAppleAuthAvailable(isAvailable);
+    };
+    checkAppleAuth();
+  }, []);
 
   const handleSignup = async () => {
     if (!email || !password || !confirmPassword || !username) {
@@ -55,6 +68,30 @@ export default function SignupScreen() {
       Alert.alert('Error', error.message || 'Failed to create account');
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleGoogleSignIn = async () => {
+    setGoogleLoading(true);
+    try {
+      await signInWithGoogle();
+      router.replace('/(tabs)');
+    } catch (error: any) {
+      Alert.alert('Error', error.message || 'Failed to sign in with Google');
+    } finally {
+      setGoogleLoading(false);
+    }
+  };
+
+  const handleAppleSignIn = async () => {
+    setAppleLoading(true);
+    try {
+      await signInWithApple();
+      router.replace('/(tabs)');
+    } catch (error: any) {
+      Alert.alert('Error', error.message || 'Failed to sign in with Apple');
+    } finally {
+      setAppleLoading(false);
     }
   };
 
@@ -120,6 +157,29 @@ export default function SignupScreen() {
               </Text>
             </TouchableOpacity>
 
+            <View style={styles.divider}>
+              <View style={styles.dividerLine} />
+              <Text style={styles.dividerText}>OR</Text>
+              <View style={styles.dividerLine} />
+            </View>
+
+            <GoogleSignInButton
+              onPress={handleGoogleSignIn}
+              disabled={googleLoading}
+              loading={googleLoading}
+              buttonText="Continue with Google"
+            />
+
+            {appleAuthAvailable && (
+              <AppleAuthentication.AppleAuthenticationButton
+                buttonType={AppleAuthentication.AppleAuthenticationButtonType.CONTINUE}
+                buttonStyle={AppleAuthentication.AppleAuthenticationButtonStyle.BLACK}
+                cornerRadius={12}
+                style={styles.appleButton}
+                onPress={handleAppleSignIn}
+              />
+            )}
+
             <TouchableOpacity onPress={() => router.push('/login')}>
               <Text style={styles.linkText}>
                 Already have an account? <Text style={styles.linkBold}>Sign In</Text>
@@ -150,11 +210,13 @@ const styles = StyleSheet.create({
     fontWeight: 'bold',
     color: '#fff',
     marginBottom: 8,
+    fontFamily: 'Montserrat-Bold',
   },
   subtitle: {
     fontSize: 16,
     color: '#94a3b8',
     marginBottom: 32,
+    fontFamily: 'Montserrat-Bold',
   },
   form: {
     gap: 16,
@@ -167,6 +229,7 @@ const styles = StyleSheet.create({
     color: '#fff',
     borderWidth: 1,
     borderColor: '#334155',
+    fontFamily: 'Montserrat-Bold',
   },
   button: {
     backgroundColor: '#2563eb',
@@ -182,14 +245,50 @@ const styles = StyleSheet.create({
     color: '#fff',
     fontSize: 16,
     fontWeight: 'bold',
+    fontFamily: 'Montserrat-Bold',
   },
   linkText: {
     color: '#94a3b8',
     textAlign: 'center',
     marginTop: 8,
+    fontFamily: 'Montserrat-Bold',
   },
   linkBold: {
     color: '#2563eb',
     fontWeight: 'bold',
+    fontFamily: 'Montserrat-Bold',
+  },
+  divider: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginVertical: 16,
+  },
+  dividerLine: {
+    flex: 1,
+    height: 1,
+    backgroundColor: '#334155',
+  },
+  dividerText: {
+    color: '#64748b',
+    paddingHorizontal: 16,
+    fontFamily: 'Montserrat-Bold',
+  },
+  googleButton: {
+    backgroundColor: '#fff',
+    borderRadius: 12,
+    padding: 16,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#e2e8f0',
+  },
+  googleButtonText: {
+    color: '#1e293b',
+    fontSize: 16,
+    fontWeight: 'bold',
+    fontFamily: 'Montserrat-Bold',
+  },
+  appleButton: {
+    width: '100%',
+    height: 50,
   },
 });

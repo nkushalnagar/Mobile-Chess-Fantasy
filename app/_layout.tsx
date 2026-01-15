@@ -1,15 +1,20 @@
-import { Stack } from 'expo-router';
+import { Slot } from 'expo-router';
 import { AuthProvider } from '@/contexts/AuthContext';
-import { View, Text } from 'react-native';
-import { useEffect, useState } from 'react';
+import { ThemeProvider } from '@/contexts/ThemeContext';
+import { DataCacheProvider } from '@/contexts/DataCacheContext';
+import { View, Animated } from 'react-native';
+import { Text } from '@/components/ThemedText';
+import { useEffect, useState, useRef } from 'react';
 import { useFonts, Montserrat_400Regular, Montserrat_500Medium, Montserrat_600SemiBold, Montserrat_700Bold } from '@expo-google-fonts/montserrat';
 import * as SplashScreen from 'expo-splash-screen';
-import * as Font from 'expo-font';
+import { useNotifications } from '@/hooks/useNotifications';
+import DraftBanner from '@/components/DraftBanner';
 
 SplashScreen.preventAutoHideAsync();
 
 export default function RootLayout() {
   const [error, setError] = useState<string | null>(null);
+  const fadeAnim = useRef(new Animated.Value(0)).current;
   const [fontsLoaded] = useFonts({
     'Montserrat-Regular': Montserrat_400Regular,
     'Montserrat-Medium': Montserrat_500Medium,
@@ -17,15 +22,8 @@ export default function RootLayout() {
     'Montserrat-Bold': Montserrat_700Bold,
   });
 
-  // Set default font for Text components
-  useEffect(() => {
-    if (fontsLoaded) {
-      const defaultFontFamily = 'Montserrat-Regular';
-      // @ts-ignore - Setting default props
-      Text.defaultProps = Text.defaultProps || {};
-      Text.defaultProps.style = { fontFamily: defaultFontFamily };
-    }
-  }, [fontsLoaded]);
+  // Initialize notifications
+  useNotifications();
 
   useEffect(() => {
     // Check if environment variables are set
@@ -39,9 +37,17 @@ export default function RootLayout() {
 
   useEffect(() => {
     if (fontsLoaded) {
-      SplashScreen.hideAsync();
+      // Fade in animation
+      Animated.timing(fadeAnim, {
+        toValue: 1,
+        duration: 800, // 800ms fade-in
+        useNativeDriver: true,
+      }).start(() => {
+        // Hide splash screen after fade-in completes
+        SplashScreen.hideAsync();
+      });
     }
-  }, [fontsLoaded]);
+  }, [fontsLoaded, fadeAnim]);
 
   if (!fontsLoaded) {
     return null;
@@ -60,29 +66,15 @@ export default function RootLayout() {
   }
 
   return (
-    <AuthProvider>
-      <Stack
-        screenOptions={{
-          headerStyle: {
-            backgroundColor: '#0f172a',
-          },
-          headerTintColor: '#fff',
-          headerTitleStyle: {
-            fontWeight: 'bold',
-          },
-        }}
-      >
-        <Stack.Screen name="index" options={{ headerShown: false }} />
-        <Stack.Screen name="login" options={{ title: 'Sign In' }} />
-        <Stack.Screen name="signup" options={{ title: 'Sign Up' }} />
-        <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
-        <Stack.Screen name="notifications" options={{ headerShown: false }} />
-        <Stack.Screen name="league/[id]" options={{ headerShown: false }} />
-        <Stack.Screen name="create-league" options={{ headerShown: false }} />
-        <Stack.Screen name="draft-room/[id]" options={{ headerShown: false }} />
-        <Stack.Screen name="league-settings/[id]" options={{ headerShown: false }} />
-        <Stack.Screen name="edit-profile" options={{ headerShown: false }} />
-      </Stack>
-    </AuthProvider>
+    <Animated.View style={{ flex: 1, opacity: fadeAnim }}>
+      <ThemeProvider>
+        <AuthProvider>
+          <DataCacheProvider>
+            <DraftBanner />
+            <Slot />
+          </DataCacheProvider>
+        </AuthProvider>
+      </ThemeProvider>
+    </Animated.View>
   );
 }

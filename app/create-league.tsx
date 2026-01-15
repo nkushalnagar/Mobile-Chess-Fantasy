@@ -10,11 +10,13 @@ import {
   Platform,
   Alert,
   Modal,
+  Switch,
 } from 'react-native';
-import Slider from '@react-native-community/slider';
-import { useRouter } from 'expo-router';
+import NumberStepper from '@/components/NumberStepper';
+import { useRouter, useLocalSearchParams } from 'expo-router';
 import { supabase } from '@/lib/supabase';
 import { useAuth } from '@/contexts/AuthContext';
+import { useTheme } from '@/contexts/ThemeContext';
 
 type LeagueType = 'tournament' | 'season';
 
@@ -32,7 +34,9 @@ const RATING_TIERS: RatingTier[] = [
 
 export default function CreateLeagueScreen() {
   const router = useRouter();
+  const { from } = useLocalSearchParams();
   const { user } = useAuth();
+  const { colors } = useTheme();
   const [leagueName, setLeagueName] = useState('');
   const [leagueType, setLeagueType] = useState<LeagueType>('tournament');
   const [picksPerPerson, setPicksPerPerson] = useState(5);
@@ -41,6 +45,7 @@ export default function CreateLeagueScreen() {
   const [selectedTier, setSelectedTier] = useState<RatingTier>(RATING_TIERS[0]);
   const [showPicksInfo, setShowPicksInfo] = useState(false);
   const [showMembersInfo, setShowMembersInfo] = useState(false);
+  const [isPublic, setIsPublic] = useState(false);
 
 
   const handleCreate = async () => {
@@ -81,6 +86,44 @@ export default function CreateLeagueScreen() {
     setIsCreating(true);
 
     try {
+      let seasonId = null;
+
+      // For season leagues, get or create an active season
+      if (leagueType === 'season') {
+        const { data: activeSeason, error: seasonError } = await supabase
+          .from('seasons')
+          .select('id')
+          .eq('status', 'active')
+          .order('start_date', { ascending: false })
+          .limit(1)
+          .single();
+
+        if (seasonError && seasonError.code !== 'PGRST116') {
+          // PGRST116 = no rows returned, which is fine
+          throw seasonError;
+        }
+
+        if (activeSeason) {
+          seasonId = activeSeason.id;
+        } else {
+          // No active season exists, create a default one
+          const currentYear = new Date().getFullYear();
+          const { data: newSeason, error: createSeasonError } = await supabase
+            .from('seasons')
+            .insert({
+              name: `${currentYear} Season`,
+              start_date: new Date().toISOString(),
+              end_date: new Date(currentYear, 11, 31).toISOString(), // End of year
+              status: 'active'
+            })
+            .select()
+            .single();
+
+          if (createSeasonError) throw createSeasonError;
+          seasonId = newSeason.id;
+        }
+      }
+
       // Create league
       const { data: league, error: leagueError } = await supabase
         .from('leagues')
@@ -91,6 +134,8 @@ export default function CreateLeagueScreen() {
           owner_id: user?.id,
           status: 'open',
           league_type: leagueType,
+          season_id: seasonId,
+          is_public: isPublic,
           // Add rating constraints for season leagues
           min_player_rating: leagueType === 'season' ? selectedTier.minRating : null,
           max_player_rating: leagueType === 'season' ? selectedTier.maxRating : null,
@@ -124,22 +169,22 @@ export default function CreateLeagueScreen() {
   return (
     <KeyboardAvoidingView
       behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-      style={styles.container}
+      style={[styles.container, { backgroundColor: colors.background }]}
     >
       <ScrollView contentContainerStyle={styles.scrollContent}>
         <View style={styles.header}>
-          <Text style={styles.title}>Create Your League</Text>
-          <Text style={styles.subtitle}>Set up your league and invite members</Text>
+          <Text style={[styles.title, { color: colors.text }]}>Create Your League</Text>
+          <Text style={[styles.subtitle, { color: colors.textSecondary }]}>Set up your league and invite members</Text>
         </View>
 
         <View style={styles.form}>
           {/* League Name */}
           <View style={styles.inputGroup}>
-            <Text style={styles.label}>League Name</Text>
+            <Text style={[styles.label, { color: colors.text }]}>League Name</Text>
             <TextInput
-              style={styles.input}
+              style={[styles.input, { backgroundColor: colors.cardBackground, borderColor: colors.border, color: colors.text }]}
               placeholder="Enter league name"
-              placeholderTextColor="#64748b"
+              placeholderTextColor={colors.textTertiary}
               value={leagueName}
               onChangeText={setLeagueName}
             />
@@ -147,24 +192,26 @@ export default function CreateLeagueScreen() {
 
           {/* League Type */}
           <View style={styles.inputGroup}>
-            <Text style={styles.label}>League Type</Text>
+            <Text style={[styles.label, { color: colors.text }]}>League Type</Text>
             <View style={styles.typeSelector}>
               <TouchableOpacity
                 style={[
                   styles.typeOption,
-                  leagueType === 'tournament' && styles.typeOptionSelected,
+                  { backgroundColor: colors.cardBackground, borderColor: colors.border },
+                  leagueType === 'tournament' && { ...styles.typeOptionSelected, backgroundColor: colors.primary, borderColor: colors.primary },
                 ]}
                 onPress={() => setLeagueType('tournament')}
               >
                 <Text
                   style={[
                     styles.typeOptionText,
-                    leagueType === 'tournament' && styles.typeOptionTextSelected,
+                    { color: colors.text },
+                    leagueType === 'tournament' && { ...styles.typeOptionTextSelected, color: '#fff' },
                   ]}
                 >
                   🏆 Tournament
                 </Text>
-                <Text style={styles.typeOptionDescription}>
+                <Text style={[styles.typeOptionDescription, { color: colors.textSecondary }]}>
                   Redraft for each tournament
                 </Text>
               </TouchableOpacity>
@@ -172,24 +219,26 @@ export default function CreateLeagueScreen() {
               <TouchableOpacity
                 style={[
                   styles.typeOption,
-                  leagueType === 'season' && styles.typeOptionSelected,
+                  { backgroundColor: colors.cardBackground, borderColor: colors.border },
+                  leagueType === 'season' && { ...styles.typeOptionSelected, backgroundColor: colors.primary, borderColor: colors.primary },
                 ]}
                 onPress={() => setLeagueType('season')}
               >
                 <Text
                   style={[
                     styles.typeOptionText,
-                    leagueType === 'season' && styles.typeOptionTextSelected,
+                    { color: colors.text },
+                    leagueType === 'season' && { ...styles.typeOptionTextSelected, color: '#fff' },
                   ]}
                 >
                   📅 Season
                 </Text>
-                <Text style={styles.typeOptionDescription}>
+                <Text style={[styles.typeOptionDescription, { color: colors.textSecondary }]}>
                   Draft once, accumulate points all season
                 </Text>
               </TouchableOpacity>
             </View>
-            <Text style={styles.helpText}>
+            <Text style={[styles.helpText, { color: colors.textSecondary }]}>
               {leagueType === 'tournament'
                 ? 'Players redraft before each major FIDE tournament. Scores reset each time.'
                 : 'Players draft once and accumulate fantasy points throughout the entire season.'}
@@ -199,32 +248,34 @@ export default function CreateLeagueScreen() {
           {/* Rating Tier (Season Leagues Only) */}
           {leagueType === 'season' && (
             <View style={styles.inputGroup}>
-              <Text style={styles.label}>Player Rating Tier</Text>
+              <Text style={[styles.label, { color: colors.text }]}>Player Rating Tier</Text>
               <View style={styles.tierSelector}>
                 {RATING_TIERS.map((tier) => (
                   <TouchableOpacity
                     key={tier.label}
                     style={[
                       styles.tierOption,
-                      selectedTier.label === tier.label && styles.tierOptionSelected,
+                      { backgroundColor: colors.cardBackground, borderColor: colors.border },
+                      selectedTier.label === tier.label && { ...styles.tierOptionSelected, backgroundColor: colors.primary + '20', borderColor: colors.primary },
                     ]}
                     onPress={() => setSelectedTier(tier)}
                   >
                     <Text
                       style={[
                         styles.tierOptionText,
-                        selectedTier.label === tier.label && styles.tierOptionTextSelected,
+                        { color: colors.text },
+                        selectedTier.label === tier.label && { ...styles.tierOptionTextSelected, color: colors.primary },
                       ]}
                     >
                       {tier.label}
                     </Text>
-                    <Text style={styles.tierPlayerCount}>
+                    <Text style={[styles.tierPlayerCount, { color: colors.textSecondary }]}>
                       {tier.playerCount} players
                     </Text>
                   </TouchableOpacity>
                 ))}
               </View>
-              <Text style={styles.helpText}>
+              <Text style={[styles.helpText, { color: colors.textSecondary }]}>
                 Only players with rating {selectedTier.minRating}+ can be drafted in this league.
               </Text>
             </View>
@@ -232,20 +283,14 @@ export default function CreateLeagueScreen() {
 
           {/* Max Members */}
           <View style={styles.inputGroup}>
-            <View style={styles.labelRow}>
-              <Text style={styles.label}>Max Members</Text>
-              <Text style={styles.sliderValue}>{maxMembers}</Text>
-            </View>
-            <Slider
-              style={styles.slider}
+            <Text style={styles.label}>Max Members</Text>
+            <NumberStepper
+              value={maxMembers}
+              onValueChange={setMaxMembers}
               minimumValue={2}
               maximumValue={20}
               step={1}
-              value={maxMembers}
-              onValueChange={setMaxMembers}
-              minimumTrackTintColor="#3b82f6"
-              maximumTrackTintColor="#334155"
-              thumbTintColor="#3b82f6"
+              color="#3b82f6"
             />
             <View style={styles.helpTextRow}>
               <Text style={styles.helpText}>Maximum number of members in this league</Text>
@@ -257,20 +302,14 @@ export default function CreateLeagueScreen() {
 
           {/* Picks Per Person */}
           <View style={styles.inputGroup}>
-            <View style={styles.labelRow}>
-              <Text style={styles.label}>Picks Per Person</Text>
-              <Text style={styles.sliderValue}>{picksPerPerson}</Text>
-            </View>
-            <Slider
-              style={styles.slider}
+            <Text style={styles.label}>Picks Per Person</Text>
+            <NumberStepper
+              value={picksPerPerson}
+              onValueChange={setPicksPerPerson}
               minimumValue={1}
               maximumValue={20}
               step={1}
-              value={picksPerPerson}
-              onValueChange={setPicksPerPerson}
-              minimumTrackTintColor="#3b82f6"
-              maximumTrackTintColor="#334155"
-              thumbTintColor="#3b82f6"
+              color="#3b82f6"
             />
             <View style={styles.helpTextRow}>
               <Text style={styles.helpText}>How many players each member drafts</Text>
@@ -279,13 +318,34 @@ export default function CreateLeagueScreen() {
               </TouchableOpacity>
             </View>
           </View>
+
+          {/* Public/Private Toggle */}
+          <View style={styles.inputGroup}>
+            <View style={styles.switchRow}>
+              <View style={styles.switchLabelContainer}>
+                <Text style={[styles.label, { color: colors.text }]}>Public League</Text>
+                <Text style={[styles.helpText, { color: colors.textSecondary }]}>
+                  {isPublic 
+                    ? 'Anyone can discover and request to join this league' 
+                    : 'Only invited users can join this league'}
+                </Text>
+              </View>
+              <Switch
+                value={isPublic}
+                onValueChange={setIsPublic}
+                trackColor={{ false: '#334155', true: '#3b82f6' }}
+                thumbColor={isPublic ? '#60a5fa' : '#94a3b8'}
+                ios_backgroundColor="#334155"
+              />
+            </View>
+          </View>
         </View>
       </ScrollView>
 
       {/* Fixed Bottom Button Bar */}
-      <View style={styles.bottomBar}>
+      <View style={[styles.bottomBar, { backgroundColor: colors.cardBackground, borderTopColor: colors.border }]}>
         <TouchableOpacity
-          style={[styles.createButton, isCreating && styles.createButtonDisabled]}
+          style={[styles.createButton, { backgroundColor: colors.primary }, isCreating && styles.createButtonDisabled]}
           onPress={handleCreate}
           disabled={isCreating}
         >
@@ -294,8 +354,14 @@ export default function CreateLeagueScreen() {
           </Text>
         </TouchableOpacity>
 
-        <TouchableOpacity onPress={() => router.back()}>
-          <Text style={styles.cancelText}>Cancel</Text>
+        <TouchableOpacity onPress={() => {
+          if (from === 'home') {
+            router.push('/(tabs)/home');
+          } else {
+            router.push('/(tabs)/leagues');
+          }
+        }}>
+          <Text style={[styles.cancelText, { color: colors.textSecondary }]}>Cancel</Text>
         </TouchableOpacity>
       </View>
 
@@ -560,5 +626,14 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: '600',
     color: '#fff',
+  },
+  switchRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 16,
+  },
+  switchLabelContainer: {
+    flex: 1,
   },
 });

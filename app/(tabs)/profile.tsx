@@ -2,9 +2,12 @@ import React from 'react';
 import { View, Text, StyleSheet, TouchableOpacity, Alert, Image, ScrollView } from 'react-native';
 import { useRouter } from 'expo-router';
 import { useAuth } from '@/contexts/AuthContext';
+import { useTheme } from '@/contexts/ThemeContext';
+import { supabase } from '@/lib/supabase';
 
 export default function ProfileTab() {
   const { user, profile, signOut } = useAuth();
+  const { colors } = useTheme();
   const router = useRouter();
 
   const handleSignOut = async () => {
@@ -29,60 +32,70 @@ export default function ProfileTab() {
     );
   };
 
+
   return (
-    <View style={styles.container}>
+    <View style={[styles.container, { backgroundColor: colors.background }]}>
       <ScrollView style={styles.content} showsVerticalScrollIndicator={false}>
-        <View style={styles.profileSection}>
-          <View style={styles.avatar}>
+        <View style={[styles.profileSection, { backgroundColor: 'transparent' }]}>
+          <View style={[styles.avatar, { backgroundColor: colors.cardBackground, borderColor: colors.border, borderWidth: 2 }]}>
             <Image
               source={require('@/assets/images/fantasy pawns/13.png')}
               style={styles.pawnAvatar}
               tintColor={(profile as any)?.pawn_color || '#2563eb'}
             />
           </View>
-          <Text style={styles.username}>{profile?.username}</Text>
-          <Text style={styles.email}>{user?.email}</Text>
+          <Text style={[styles.username, { color: colors.text }]}>{profile?.username}</Text>
+          <Text style={[styles.email, { color: colors.textSecondary }]}>{user?.email}</Text>
         </View>
 
         <View style={styles.section}>
-          <Text style={styles.sectionTitle}>Account</Text>
+          <Text style={[styles.sectionTitle, { color: colors.text }]}>Account</Text>
           <TouchableOpacity 
-            style={styles.menuItem}
-            onPress={() => router.push('/edit-profile')}
+            style={[styles.menuItem, { backgroundColor: colors.cardBackground, borderColor: colors.border }]}
+            onPress={() => router.push('/edit-profile?from=profile')}
           >
-            <Text style={styles.menuItemText}>Edit Profile</Text>
-            <Text style={styles.menuItemArrow}>›</Text>
+            <Text style={[styles.menuItemText, { color: colors.text }]}>Edit Profile</Text>
+            <Text style={[styles.menuItemArrow, { color: colors.textSecondary }]}>›</Text>
           </TouchableOpacity>
           <TouchableOpacity 
-            style={styles.menuItem}
-            onPress={() => router.push('/notifications')}
+            style={[styles.menuItem, { backgroundColor: colors.cardBackground, borderColor: colors.border }]}
+            onPress={() => router.push('/notifications?from=profile')}
           >
-            <Text style={styles.menuItemText}>Notifications</Text>
-            <Text style={styles.menuItemArrow}>›</Text>
+            <Text style={[styles.menuItemText, { color: colors.text }]}>Notifications</Text>
+            <Text style={[styles.menuItemArrow, { color: colors.textSecondary }]}>›</Text>
           </TouchableOpacity>
         </View>
 
         <View style={styles.section}>
-          <Text style={styles.sectionTitle}>About</Text>
-          <TouchableOpacity style={styles.menuItem}>
-            <Text style={styles.menuItemText}>Help & Support</Text>
-            <Text style={styles.menuItemArrow}>›</Text>
+          <Text style={[styles.sectionTitle, { color: colors.text }]}>About</Text>
+          <TouchableOpacity 
+            style={[styles.menuItem, { backgroundColor: colors.cardBackground, borderColor: colors.border }]}
+            onPress={() => router.push('/support-tickets')}
+          >
+            <Text style={[styles.menuItemText, { color: colors.text }]}>Help & Support</Text>
+            <Text style={[styles.menuItemArrow, { color: colors.textSecondary }]}>›</Text>
           </TouchableOpacity>
-          <TouchableOpacity style={styles.menuItem}>
-            <Text style={styles.menuItemText}>Terms of Service</Text>
-            <Text style={styles.menuItemArrow}>›</Text>
+          <TouchableOpacity 
+            style={[styles.menuItem, { backgroundColor: colors.cardBackground, borderColor: colors.border }]}
+            onPress={() => router.push('/terms-of-service')}
+          >
+            <Text style={[styles.menuItemText, { color: colors.text }]}>Terms of Service</Text>
+            <Text style={[styles.menuItemArrow, { color: colors.textSecondary }]}>›</Text>
           </TouchableOpacity>
-          <TouchableOpacity style={styles.menuItem}>
-            <Text style={styles.menuItemText}>Privacy Policy</Text>
-            <Text style={styles.menuItemArrow}>›</Text>
+          <TouchableOpacity 
+            style={[styles.menuItem, { backgroundColor: colors.cardBackground, borderColor: colors.border }]}
+            onPress={() => router.push('/privacy-policy')}
+          >
+            <Text style={[styles.menuItemText, { color: colors.text }]}>Privacy Policy</Text>
+            <Text style={[styles.menuItemArrow, { color: colors.textSecondary }]}>›</Text>
           </TouchableOpacity>
         </View>
 
-        <TouchableOpacity style={styles.signOutButton} onPress={handleSignOut}>
+        <TouchableOpacity style={[styles.signOutButton, { backgroundColor: colors.error }]} onPress={handleSignOut}>
           <Text style={styles.signOutButtonText}>Sign Out</Text>
         </TouchableOpacity>
 
-        <Text style={styles.version}>Version 1.0.0</Text>
+        <Text style={[styles.version, { color: colors.textTertiary }]}>Version 1.0.0</Text>
       </ScrollView>
     </View>
   );
@@ -179,5 +192,6 @@ const styles = StyleSheet.create({
     color: '#64748b',
     fontSize: 12,
     marginTop: 24,
+    marginBottom: 40,
   },
 });
